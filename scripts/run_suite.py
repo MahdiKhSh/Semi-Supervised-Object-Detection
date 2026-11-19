@@ -326,12 +326,20 @@ def main(argv=None):
                 print(analysis.stdout.strip(), flush=True)
         from report_results import write_report
         write_report(args.output / "results.csv", args.output)
+        if args.preset in ("core", "paper"):
+            from plot_results import render
+            render(args.output)
         print(f"COMPLETE: {job['name']}", flush=True)
         completed += 1
         if args.run_limit > 0 and completed >= args.run_limit:
             print("Stopped by --run-limit; no claim of full experiment completion.", flush=True)
             break
     n = summarize(args.output)
+    from report_results import write_report
+    write_report(args.output / "results.csv", args.output)
+    if args.preset in ("core", "paper"):
+        from plot_results import render
+        render(args.output)
     print(f"Experiment runner finished. {n} completed run records in {args.output / 'results.csv'}", flush=True)
 
 
