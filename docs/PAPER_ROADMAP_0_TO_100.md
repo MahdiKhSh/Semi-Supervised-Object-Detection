@@ -78,7 +78,7 @@ Call B1 a native **Mean Teacher**, not a SoftTeacher reproduction.
 ## 50–70: Ablations and sensitivity
 
 - Fixed confidence thresholds: 0.50 / 0.70 / 0.90.
-- Localization reliability scale: 0 vs 4.
+- Localization agreement gating: enabled vs disabled (remove second-view localization filtering).
 - Class adaptation: strength 0 vs 0.12.
 - Condition offset: 0 vs +0.05.
 - Consistency class term on/off.

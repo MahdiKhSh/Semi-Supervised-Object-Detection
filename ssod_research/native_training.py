@@ -123,6 +123,7 @@ def compute_threshold(cls, base, *, adaptive, counts, strength, condition_enable
 @torch.no_grad()
 def pseudo_targets(teacher, images, *, variant, threshold, min_quality,
                    localization_scale, agreement_iou, counts, adaptive_strength,
+                   localization_enabled,
                    attrs_list, condition_offset):
     """Teacher predicts on original and optionally hflipped view.
 
@@ -133,7 +134,7 @@ def pseudo_targets(teacher, images, *, variant, threshold, min_quality,
     teacher.eval()
     standard = teacher(images)
     repeated = None
-    if variant in ("reliability", "adaptive", "condition", "full"):
+    if localization_enabled and variant in ("reliability", "adaptive", "condition", "full"):
         repeated = teacher([torch.flip(im, dims=(-1,)) for im in images])
     result, stats = [], {"candidates": 0, "accepted": 0, "quality_sum": 0.0}
     for i, (image, pred) in enumerate(zip(images, standard)):
@@ -335,6 +336,7 @@ def parse_args(argv=None):
     p.add_argument("--min-quality", type=float, default=0.3)
     p.add_argument("--agreement-iou", type=float, default=0.5)
     p.add_argument("--localization-scale", type=float, default=4.0)
+    p.add_argument("--localization-enabled", type=int, choices=(0, 1), default=1)
     p.add_argument("--adaptive-strength", type=float, default=0.12)
     p.add_argument("--condition-offset", type=float, default=0.05)
     p.add_argument("--unsup-weight", type=float, default=1.0)
@@ -506,6 +508,7 @@ def train(args):
                     teacher, originals, variant=args.variant, threshold=args.pseudo_threshold,
                     min_quality=args.min_quality, localization_scale=args.localization_scale,
                     agreement_iou=args.agreement_iou, counts=counts,
+                    localization_enabled=bool(args.localization_enabled),
                     adaptive_strength=args.adaptive_strength, attrs_list=attributes,
                     condition_offset=args.condition_offset)
                 extra.update(statistics)

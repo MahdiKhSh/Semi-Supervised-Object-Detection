@@ -67,7 +67,7 @@ def experiment_plan(preset, train_steps=None, warmup_steps=None, max_side=None):
             ("full", .7, "no_box", {"box_weight": 0.}),
             ("full", .7, "no_class", {"class_weight": 0.}),
             ("full", .7, "no_conf", {"confidence_weight": 0.}),
-            ("full", .7, "no_localization", {"localization_scale": 0.}),
+            ("full", .7, "no_localization", {"localization_enabled": 0}),
             ("full", .7, "no_condition", {"condition_offset": 0.}),
             ("full", .7, "no_extra_consistency", {"consistency_weight": 0.}),
         ]
@@ -196,7 +196,7 @@ def job_complete(job):
     saved = status.get("arguments", {})
     for flag in ("variant", "seed", "max_side", "batch_size", "pseudo_threshold",
                  "box_weight", "class_weight", "confidence_weight",
-                 "localization_scale", "adaptive_strength", "condition_offset",
+                 "localization_scale", "localization_enabled", "adaptive_strength", "condition_offset",
                  "consistency_weight", "init_checkpoint", "train_images", "val_images"):
         planned = _flag(job["command"], flag)
         if planned is not None and str(saved.get(flag)) != str(planned):
