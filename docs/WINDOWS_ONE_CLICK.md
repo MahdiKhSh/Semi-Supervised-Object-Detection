@@ -43,13 +43,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\prepare_data_windo
 |---|---|---|
 | RUN_SMOKE.cmd | Synthetic data, supervised warmup, EMA baseline, full variant | Not paper data |
 | RUN_PILOT.cmd | Real 10% labeled, one seed, main variants + thresholds + ablations | Partial validation only; diagnostic |
-| RUN_ALL.cmd | Real 5%/10% labeled, three seeds, all components and thresholds | Paper-scale study, requires substantial GPU time |
+| RUN_CORE.cmd | 5%/10%, three seeds, key baselines and one-seed ablations | Compute-aware core paper matrix (52 stages) |
+| RUN_ALL.cmd | Real 5%/10% labeled, three seeds, all components and thresholds | Exhaustive 102-stage study, significant GPU time |
+| RUN_VISUALIZE.cmd | Real-image overlays from trained CORE checkpoint | Qualitative evidence, not an AP metric |
 
 Each launcher prepares the isolated virtual environment, runs tests,
 verifies the CUDA compute capability, then runs its matrix sequentially.
 The launcher never kills unrelated GPU processes. On failure, inspect
 work_dirs/<preset>/logs and double-click again. Completed stages are
 skipped, interrupted stages resume from saved checkpoint when possible.
+
+For commands, output locations and the full protocol in Persian see [ROADMAP_FA.md](ROADMAP_FA.md).
 
 **Important compute warning:** the full paper matrix includes 102 stages
 (6 fraction/seed combinations × [preparation + supervised warmup +

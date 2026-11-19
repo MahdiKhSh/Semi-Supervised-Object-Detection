@@ -20,8 +20,9 @@ in clean-condition AP?
    localization gate, quality floor, per-class thresholds.
 6. Evaluate COCO AP@[.50:.95], AP50, AP75, per-class AP, day/night
    condition subsets, class frequency, throughput, peak VRAM and wall time.
-   The supplied converter does not yet preserve scene attributes in COCO:
-   implement a condition manifest before claiming day/night comparisons.
+   The converter now writes separate train_attributes.json; condition-specific
+   AP is calculated against original BDD validation metadata. Scene attributes
+   are additional weak auxiliary supervision and must be disclosed.
 7. Repeat with seeds 42, 123 and 2026 if compute permits; report
    mean/std and confidence intervals rather than a single lucky run.
 8. Record all failed runs and changes transparently.

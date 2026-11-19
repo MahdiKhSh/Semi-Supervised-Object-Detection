@@ -1,6 +1,9 @@
-# RTX 5090 deployment checklist (Windows / Linux)
+# Native Windows RTX 5090 environment checklist
 
-The remote hardware cannot be accessed from this chat.
+The remote RTX 5090 cannot be accessed from this chat.
+For the PRIMARY pipeline use RUN_SMOKE.cmd / RUN_CORE.cmd / RUN_ALL.cmd
+with native TorchVision; do not install MMDetection/MMCV unless conducting
+an explicit optional replication comparison.
 
 1. Identify OS, driver, GPU and CUDA capability:
    `nvidia-smi`
