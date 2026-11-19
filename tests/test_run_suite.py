@@ -3,12 +3,12 @@ from scripts.run_suite import experiment_plan, generate_jobs, parse_args
 
 
 def test_plan_matrices_have_warmup_and_unique_names(tmp_path):
-    for preset in ("smoke", "pilot", "paper"):
+    for preset in ("smoke", "pilot", "core", "paper"):
         args = parse_args(["--preset", preset, "--output", str(tmp_path)])
         jobs = generate_jobs(args)
         names = [job["name"] for job in jobs]
         assert len(names) == len(set(names))
-        assert sum(x["type"] == "prepare" for x in jobs) == (6 if preset == "paper" else 1)
+        assert sum(x["type"] == "prepare" for x in jobs) == (6 if preset in ("core", "paper") else 1)
         assert sum("warmup" in x["name"] for x in jobs) == (6 if preset == "paper" else 1)
         assert any("--variant" in x["command"] and "full" in x["command"] for x in jobs)
         assert any("--variant" in x["command"] and "supervised" in x["command"] for x in jobs)
@@ -36,3 +36,11 @@ def test_paper_has_all_seeds_and_fractions(tmp_path):
             assert f"{pct}_s{seed}/warmup" in names
             assert f"{pct}_s{seed}/no_localization" in names
             assert f"{pct}_s{seed}/no_extra_consistency" in names
+
+def test_core_matrix_size_and_seed_scoped_ablations(tmp_path):
+    args = parse_args(["--preset", "core", "--output", str(tmp_path)])
+    jobs = generate_jobs(args)
+    assert len(jobs) == 52
+    assert any(j["name"] == "05pct_s42/no_box" for j in jobs)
+    assert not any(j["name"] == "05pct_s123/no_box" for j in jobs)
+    assert any(j["name"] == "10pct_s2026/full" for j in jobs)

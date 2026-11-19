@@ -23,7 +23,7 @@ PAPER_FRACTIONS = (.05, .10)
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser()
-    p.add_argument("--preset", choices=("smoke", "pilot", "paper"), default="paper")
+    p.add_argument("--preset", choices=("smoke", "pilot", "core", "paper"), default="paper")
     p.add_argument("--train-labels", type=Path, default=ROOT / "data/bdd100k/raw/labels_train.json")
     p.add_argument("--val-labels", type=Path, default=ROOT / "data/bdd100k/raw/labels_val.json")
     p.add_argument("--train-images", type=Path, default=ROOT / "data/bdd100k/images/train")
@@ -57,6 +57,21 @@ def experiment_plan(preset, train_steps=None, warmup_steps=None, max_side=None):
                      ("full", .7, "no_class", {"class_weight": 0.}),
                      ("full", .7, "no_conf", {"confidence_weight": 0.})]
         return specs, selected, warmup_steps or 30, train_steps or 100, max_side or 384
+    if preset == "core":
+        specs = tuple((f, s) for f in PAPER_FRACTIONS for s in PAPER_SEEDS)
+        selected = [(v, .7, v, {}) for v in
+                    ("supervised", "mean_teacher", "reliability", "full")]
+        selected += [
+            ("full", .5, "threshold05", {}),
+            ("full", .9, "threshold09", {}),
+            ("full", .7, "no_box", {"box_weight": 0.}),
+            ("full", .7, "no_class", {"class_weight": 0.}),
+            ("full", .7, "no_conf", {"confidence_weight": 0.}),
+            ("full", .7, "no_localization", {"localization_scale": 0.}),
+            ("full", .7, "no_condition", {"condition_offset": 0.}),
+            ("full", .7, "no_extra_consistency", {"consistency_weight": 0.}),
+        ]
+        return specs, selected, warmup_steps or 1000, train_steps or 3000, max_side or 512
     specs = tuple((f, s) for f in PAPER_FRACTIONS for s in PAPER_SEEDS)
     selected = [(v, .7, v, {}) for v in VARIANTS]
     selected += [
@@ -88,7 +103,7 @@ def generate_jobs(args):
             "--val-images", str(args.val_images), "--device", args.device,
             "--batch-size", str(args.batch_size), "--max-side", str(side),
             "--seed", str(seed), "--save-every", "250" if args.preset == "paper" else "10",
-            "--eval-every", str(train_steps) if args.preset != "paper" else "2000",
+            "--eval-every", str(train_steps) if args.preset in ("smoke", "pilot") else "2000",
             "--amp", "bf16" if args.device != "cpu" else "off",
         ]
         if args.preset == "smoke":
@@ -110,6 +125,9 @@ def generate_jobs(args):
                      "command": warmup_cmd})
         init = warmup_output / "last.pth"
         for variant, threshold, tag, kw in variants:
+            if args.preset == "core" and seed != 42 and tag not in (
+                "supervised", "mean_teacher", "reliability", "full"):
+                continue
             output = root / tag
             run_cmd = [sys.executable, "-m", "ssod_research.native_training",
                        "--variant", variant, "--steps", str(train_steps),
@@ -279,7 +297,7 @@ def main(argv=None):
         if return_code:
             print(f"FAILED: {job['name']} (exit {return_code}). See {log}", file=sys.stderr, flush=True)
             raise SystemExit(return_code)
-        if job["type"] == "train" and args.preset == "paper":
+        if job["type"] == "train" and args.preset in ("core", "paper"):
             # The scientific result is the full-validation final checkpoint.
             final_predictions = Path(job["output"]) / f"eval_{job['steps']:07d}" / "detections.json"
             if not final_predictions.is_file():
