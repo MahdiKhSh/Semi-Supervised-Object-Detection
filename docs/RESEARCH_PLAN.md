@@ -42,8 +42,9 @@ in clean-condition AP?
 - **No training performance measurements have been generated yet.**
 
 ## Known implementation limits
-- Current optional extension is a reliability-aware *selector*, not a new
-  end-to-end differentiable spatial/class/confidence consistency loss.
+- Optional extension now includes a differentiable ROI-level three-term
+  loss, **not yet integration-tested on the full MMDetection training loop**.
+  This is not proof of mathematical novelty or trained performance.
 - COCO-style annotations alone do not fully encode BDD weather/time metadata.
 - CUDA/C++ MMCV wheel availability for RTX 5090 has not been tested.
 - Some MMDetection versions may require minor config adaptation.

@@ -7,7 +7,7 @@ Research scaffold for **BDD100K RGB 2D object detection** using OpenMMLab MMDete
 - Framework: [MMDetection](https://github.com/open-mmlab/mmdetection), Apache-2.0. We **do not vendor/copy the full framework**; clone and pin it separately.
 - Baseline: [Soft Teacher](https://arxiv.org/abs/2106.09018), as implemented in MMDetection 3.x.
 - Additional prior art: [Consistent-Teacher](https://github.com/Adamdad/ConsistentTeacher), [Sparse Semi-DETR](https://arxiv.org/abs/2404.01819), [STEP-DETR](https://openaccess.thecvf.com/content/ICCV2025/html/Shehzadi_STEP-DETR_Advancing_DETR-based_Semi-Supervised_Object_Detection_with_Super_Teacher_and_ICCV_2025_paper.html), and SSRT-DETR (Sensors, 2026).
-- The optional `ReliabilitySoftTeacher` extends existing pseudo-label filtering with a *prototype* confidence/uncertainty gate. **It is not established novelty, nor a finished three-term consistency loss.** Compare it against the original SoftTeacher with identical settings.
+- The optional `ReliabilitySoftTeacher` extends existing pseudo-label filtering with a *prototype* reliability gate and differentiable ROI-level three-term consistency regularizer. **It is not established novelty; integration with actual GPU training is unverified.** Compare it against the original SoftTeacher with identical settings.
 
 ## Repository contents
 

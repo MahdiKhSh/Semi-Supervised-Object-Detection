@@ -1,4 +1,5 @@
-# Ablation: identical data/model setup, but enable experimental pseudo-label gate.
+# Ablation: identical data/model setup with reliability selector and optional
+# differentiable matched-ROI multi-level consistency.
 _base_ = ['./bdd_softteacher.py']
 custom_imports = dict(imports=['ssod_research.mmdet_extension'], allow_failed_imports=False)
 model = dict(
@@ -8,6 +9,10 @@ model = dict(
         reliability_loc_scale=4.0,
         reliability_min_score=0.5,
         reliability_min_quality=0.3,
-        # Optional thresholds: one entry per BDD category in exact class order.
-        reliability_class_thresholds=None))
+        reliability_class_thresholds=None,
+        enable_consistency=True,
+        consistency_weight=0.5,
+        consistency_box_weight=1.0,
+        consistency_class_weight=1.0,
+        consistency_confidence_weight=0.25))
 work_dir = 'work_dirs/bdd_reliability'
