@@ -246,6 +246,35 @@ def main(argv=None):
         if return_code:
             print(f"FAILED: {job['name']} (exit {return_code}). See {log}", file=sys.stderr, flush=True)
             raise SystemExit(return_code)
+        if job["type"] == "train" and args.preset == "paper":
+            # The scientific result is the full-validation final checkpoint.
+            final_predictions = Path(job["output"]) / f"eval_{job['steps']:07d}" / "detections.json"
+            if not final_predictions.is_file():
+                raise RuntimeError(f"Missing final COCO detections: {final_predictions}")
+            # The COCO validation annotations live in this job's split root.
+            tokens = job["name"].split("/")
+            split_root = args.output / "splits" / tokens[0]
+            coco_val = split_root / "annotations" / "val.json"
+            analysis_dir = Path(job["output"]) / "analysis"
+            analysis_dir.mkdir(parents=True, exist_ok=True)
+            for script, options in (
+                ("eval_per_class.py",
+                 ["--coco-val", str(coco_val),
+                  "--predictions", str(final_predictions),
+                  "--output", str(analysis_dir / "per_class.json")]),
+                ("eval_conditions.py",
+                 ["--bdd-val-json", str(args.val_labels),
+                  "--coco-val", str(coco_val),
+                  "--predictions", str(final_predictions),
+                  "--output", str(analysis_dir / "conditions.json")]),
+            ):
+                analysis = subprocess.run([sys.executable, str(ROOT / "scripts" / script), *options],
+                                          cwd=ROOT, capture_output=True, text=True)
+                if analysis.returncode:
+                    raise RuntimeError(f"{script} failed: {analysis.stderr[-2000:]}")
+                print(analysis.stdout.strip(), flush=True)
+        from report_results import write_report
+        write_report(args.output / "results.csv", args.output)
         print(f"COMPLETE: {job['name']}", flush=True)
         completed += 1
         if args.run_limit > 0 and completed >= args.run_limit:
