@@ -9,7 +9,7 @@ def test_plan_matrices_have_warmup_and_unique_names(tmp_path):
         names = [job["name"] for job in jobs]
         assert len(names) == len(set(names))
         assert sum(x["type"] == "prepare" for x in jobs) == (6 if preset in ("core", "paper") else 1)
-        assert sum("warmup" in x["name"] for x in jobs) == (6 if preset == "paper" else 1)
+        assert sum("warmup" in x["name"] for x in jobs) == (6 if preset in ("core", "paper") else 1)
         assert any("--variant" in x["command"] and "full" in x["command"] for x in jobs)
         assert any("--variant" in x["command"] and "supervised" in x["command"] for x in jobs)
         for job in jobs:
