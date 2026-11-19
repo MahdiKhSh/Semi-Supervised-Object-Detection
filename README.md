@@ -13,7 +13,8 @@ training on BDD100K. Scientific novelty is not yet established.
 3. Place official BDD100K images and labels into the directories specified
    in [Windows guide](docs/WINDOWS_ONE_CLICK.md).
 4. Double-click **RUN_PILOT.cmd** for 10% labeled pilot and exploratory ablations.
-5. Double-click **RUN_ALL.cmd** for the complete **5%/10% × 3-seed**
+5. Optionally run **RUN_CORE.cmd** for the compute-aware scientific core.
+6. Double-click **RUN_ALL.cmd** for the complete **5%/10% × 3-seed**
    training matrix: 102 sequential stages including supervised warmups,
    teacher/student, reliability, condition/class adaptation, three-level
    consistency, threshold sweeps and on/off ablations.
@@ -71,4 +72,4 @@ comparisons require running the Windows launchers on the user's machine.
 
 Read [Windows one-click guide](docs/WINDOWS_ONE_CLICK.md),
 [full experiment roadmap](docs/PAPER_ROADMAP_0_TO_100.md),
-and [experiment protocol](docs/RESEARCH_PLAN.md).
+[Persian execution roadmap](docs/ROADMAP_FA.md), and [experiment protocol](docs/RESEARCH_PLAN.md).
