@@ -11,6 +11,7 @@ dependencies = ["numpy>=1.24,<3"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6"]
+native = ["Pillow>=10", "pycocotools>=2.0.7"]
 full = ["torch", "mmengine", "mmcv", "mmdet"]
 
 [tool.setuptools.packages.find]

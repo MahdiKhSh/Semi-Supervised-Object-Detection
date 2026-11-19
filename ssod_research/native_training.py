@@ -310,6 +310,8 @@ def evaluate(model, val_data, device, output_dir, *, max_images=None):
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="TorchVision road SSOD experiment")
     p.add_argument("--data-root", default="data/bdd100k")
+    p.add_argument("--train-images", default=None)
+    p.add_argument("--val-images", default=None)
     p.add_argument("--output", required=True)
     p.add_argument("--variant", choices=VARIANTS, required=True)
     p.add_argument("--seed", type=int, default=42)
@@ -367,16 +369,18 @@ def train(args):
     label_path = root / "annotations" / "labeled.json"
     unlabeled_path = root / "annotations" / "unlabeled.json"
     val_path = root / "annotations" / "val.json"
+    train_dir = Path(args.train_images) if args.train_images else root / "images" / "train"
+    val_dir = Path(args.val_images) if args.val_images else root / "images" / "val"
     inventories = {
-        "labeled": image_inventory_check(label_path, root / "images" / "train"),
-        "validation": image_inventory_check(val_path, root / "images" / "val"),
+        "labeled": image_inventory_check(label_path, train_dir),
+        "validation": image_inventory_check(val_path, val_dir),
     }
     if args.variant != "supervised":
-        inventories["unlabeled"] = image_inventory_check(unlabeled_path, root / "images" / "train")
-    labeled = RoadCocoDataset(label_path, root / "images" / "train", args.max_side, require_labels=True)
-    unlabeled = (RoadCocoDataset(unlabeled_path, root / "images" / "train", args.max_side)
+        inventories["unlabeled"] = image_inventory_check(unlabeled_path, train_dir)
+    labeled = RoadCocoDataset(label_path, train_dir, args.max_side, require_labels=True)
+    unlabeled = (RoadCocoDataset(unlabeled_path, train_dir, args.max_side)
                  if args.variant != "supervised" else None)
-    validation = RoadCocoDataset(val_path, root / "images" / "val", args.max_side)
+    validation = RoadCocoDataset(val_path, val_dir, args.max_side)
     named = set(im["file_name"] for im in labeled.images)
     if unlabeled is not None and named.intersection(im["file_name"] for im in unlabeled.images):
         raise ValueError("labeled/unlabeled image leakage")

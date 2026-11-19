@@ -85,6 +85,8 @@ def main():
         "unlabeled.json": convert(unlabeled, False),
         "val.json": convert(val, True),
     }
+    attributes = {r["name"]: r.get("attributes", {}) for r in train}
+    (ann_dir / "train_attributes.json").write_text(json.dumps(attributes, separators=(",", ":")), encoding="utf-8")
     for filename, obj in outputs.items():
         (ann_dir / filename).write_text(json.dumps(obj, separators=(",", ":")), encoding="utf-8")
     report = {
