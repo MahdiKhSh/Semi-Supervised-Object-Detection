@@ -22,6 +22,8 @@ jobs:
       - name: Install config parser
         run: python -m pip install "mmengine>=0.7.1,<1"
       - name: Clone external baseline to the required location
-        run: git clone --depth 1 https://github.com/open-mmlab/mmdetection.git third_party/mmdetection
+        run: |
+          git clone https://github.com/open-mmlab/mmdetection.git third_party/mmdetection
+          git -C third_party/mmdetection checkout cfd5d3a985b0249de009b67d04f37263e11cdf3d
       - name: Resolve proposed MMDetection configs
         run: python scripts/check_configs.py

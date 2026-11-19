@@ -12,7 +12,7 @@ The remote hardware cannot be accessed from this chat.
    `python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available()); print(torch.cuda.get_device_capability() if torch.cuda.is_available() else 'no CUDA')"`
    RTX 5090 should expose compute capability 12.0.
 4. Clone `open-mmlab/mmdetection` at a **recorded tested revision** under
-   `third_party/mmdetection`, then install compatible MMEngine and MMCV.
+   `third_party/mmdetection` and checkout `cfd5d3a985b0249de009b67d04f37263e11cdf3d`, then install compatible MMEngine and MMCV.
    OpenMMLab wheels and custom CUDA ops must match torch/CUDA.
 5. Check `python -c "import mmcv, mmengine, mmdet; print(mmcv.__version__, mmengine.__version__, mmdet.__version__)"`
 6. Run CPU tests, then a tiny training smoke test with 2 iterations and a

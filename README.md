@@ -22,7 +22,7 @@ Research scaffold for **BDD100K RGB 2D object detection** using OpenMMLab MMDete
 ## Quick start
 
 1. Install Python 3.11 and a Blackwell-compatible **official PyTorch/CUDA build** for your RTX 5090. Verify `torch.cuda.is_available()` and `torch.cuda.get_device_capability()` before installing MMCV. Do not reuse old pre-Blackwell wheels blindly.
-2. `git clone https://github.com/open-mmlab/mmdetection.git third_party/mmdetection`; checkout and record a *specific tested commit*. Follow that version's installation instructions for `mmengine`, `mmcv` and `mmdet`. The `third_party/` directory is gitignored.
+2. `git clone https://github.com/open-mmlab/mmdetection.git third_party/mmdetection`; checkout pinned commit `cfd5d3a985b0249de009b67d04f37263e11cdf3d` and record any subsequent upgrade. Follow that version's installation instructions for `mmengine`, `mmcv` and `mmdet`. Run `git -C third_party/mmdetection checkout cfd5d3a985b0249de009b67d04f37263e11cdf3d`. The `third_party/` directory is gitignored.
 3. `python -m pip install -e ".[dev]"`; run `python -m pytest -q`.
 4. Download BDD100K detection images and labels yourself and review dataset license.
 5. `python scripts/prepare_bdd100k.py --train-labels DATA/bdd100k_labels_images_train.json --val-labels DATA/bdd100k_labels_images_val.json --output data/bdd100k --fraction 0.10 --seed 42`
