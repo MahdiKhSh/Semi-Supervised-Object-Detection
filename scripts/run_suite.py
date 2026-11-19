@@ -142,15 +142,48 @@ def validate_input_files(args):
             raise FileNotFoundError(f"Missing BDD image folder: {directory}. See docs/WINDOWS_ONE_CLICK.md.")
 
 
+def _flag(command, name):
+    name = "--" + name.replace("_", "-")
+    try:
+        return command[command.index(name) + 1]
+    except (ValueError, IndexError):
+        return None
+
+
 def job_complete(job):
     if job["type"] == "prepare":
-        return Path(job["output"]).is_file()
+        path = Path(job["output"])
+        if not path.is_file():
+            return False
+        manifest = json.loads(path.read_text(encoding="utf8"))
+        fraction = _flag(job["command"], "fraction")
+        seed = _flag(job["command"], "seed")
+        if float(manifest.get("label_fraction", -1)) != float(fraction):
+            raise RuntimeError(f"Split fraction changed: {path}")
+        if int(manifest.get("seed", -1)) != int(seed):
+            raise RuntimeError(f"Split seed changed: {path}")
+        from hashlib import sha256
+        for filename, key in (("train_labels", "train_source_sha256"),
+                              ("val_labels", "val_source_sha256")):
+            source = Path(_flag(job["command"], filename))
+            if sha256(source.read_bytes()).hexdigest() != manifest.get(key):
+                raise RuntimeError(f"Split source changed: {source}; use a new output folder")
+        return True
     out = Path(job["output"])
     status_file = out / "manifest.json"
     metric_file = out / "evaluations.jsonl"
     if not status_file.is_file() or not metric_file.is_file():
         return False
     status = json.loads(status_file.read_text(encoding="utf8"))
+    saved = status.get("arguments", {})
+    for flag in ("variant", "seed", "max_side", "batch_size", "pseudo_threshold",
+                 "box_weight", "class_weight", "confidence_weight",
+                 "localization_scale", "adaptive_strength", "condition_offset",
+                 "consistency_weight", "init_checkpoint", "train_images", "val_images"):
+        planned = _flag(job["command"], flag)
+        if planned is not None and str(saved.get(flag)) != str(planned):
+            raise RuntimeError(f"Run settings changed for {out}: {flag}: "
+                               f"{saved.get(flag)} versus {planned}. Use a new output path.")
     if status.get("status") != "completed":
         return False
     lines = [s for s in metric_file.read_text(encoding="utf8").splitlines() if s.strip()]

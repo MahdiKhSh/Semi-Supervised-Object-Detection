@@ -26,7 +26,8 @@ def load_rows(path):
         return []
     with Path(path).open(encoding="utf8", newline="") as f:
         rows = list(csv.DictReader(f))
-    return [r for r in rows if r.get("AP") not in (None, "", "None")]
+    return [r for r in rows if r.get("AP") not in (None, "", "None")
+            and str(r.get("partial_validation", "")).lower() not in ("true", "1")]
 
 
 def stats_for_rows(rows):

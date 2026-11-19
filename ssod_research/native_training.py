@@ -52,10 +52,17 @@ def build_model(*, pretrained_backbone, max_side, min_size=None):
     """Same backbone and detector hyperparameters across all variants."""
     backbone_weights = ResNet50_Weights.IMAGENET1K_V1 if pretrained_backbone else None
     size = int(min_size or max_side)
-    return fasterrcnn_resnet50_fpn(
+    detector = fasterrcnn_resnet50_fpn(
         weights=None, weights_backbone=backbone_weights,
         num_classes=len(BDD_CLASSES), min_size=size, max_size=int(max_side),
         box_detections_per_img=100, trainable_backbone_layers=3)
+    # TorchVision ignores trainable_backbone_layers without pretrained weights.
+    # Fix the unfrozen-stage set after a no-download supervised warm start so
+    # all variants actually train the SAME backbone layers.
+    for name, parameter in detector.backbone.body.named_parameters():
+        if not name.startswith(("layer2.", "layer3.", "layer4.")):
+            parameter.requires_grad_(False)
+    return detector
 
 
 def portable_targets(batch, device):
