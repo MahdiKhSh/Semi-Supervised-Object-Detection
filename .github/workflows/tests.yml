@@ -58,3 +58,10 @@ jobs:
         run: python -m pytest -q tests/test_native_training.py tests/test_native_data.py tests/test_native_regularizer.py
       - name: Synthetic end-to-end 1-step model / EMA / regularizer run
         run: python scripts/run_suite.py --preset smoke --device cpu --max-side 128 --warmup-steps 1 --train-steps 1 --output work_dirs/ci_smoke
+      - name: Verify smoke resumability
+        run: python scripts/run_suite.py --preset smoke --device cpu --max-side 128 --warmup-steps 1 --train-steps 1 --output work_dirs/ci_smoke
+      - name: Synthetic core-run checks (real evaluator, reports and figures)
+        run: |
+          python scripts/make_synthetic_bdd.py --output work_dirs/ci_core_source
+          python scripts/run_suite.py --preset core --device cpu --max-side 128 --warmup-steps 1 --train-steps 1 --run-limit 3 --train-labels work_dirs/ci_core_source/synthetic_train_labels.json --val-labels work_dirs/ci_core_source/synthetic_val_labels.json --train-images work_dirs/ci_core_source/images/train --val-images work_dirs/ci_core_source/images/val --output work_dirs/ci_core
+          python -c "from pathlib import Path; r=Path('work_dirs/ci_core'); assert (r/'PAPER_RESULTS.md').exists(); assert (r/'runs/05pct_s42/supervised/analysis/conditions.json').exists(); assert (r/'runs/05pct_s42/supervised/analysis/per_class.json').exists(); assert (r/'figures/ap_05pct.png').exists(); print('All research reports generated')"
