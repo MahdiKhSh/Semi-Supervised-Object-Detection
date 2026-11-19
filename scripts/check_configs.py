@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Validate MMEngine config resolution and key research invariants, no GPU."""
+"""Validate MMEngine config resolution and key research invariants, no GPU.
+
+This is deliberately a static validation: importing the custom detector
+requires torch, mmcv compiled ops and mmdet, tested separately on the GPU host.
+"""
 from pathlib import Path
 from mmengine.config import Config
 
@@ -10,7 +14,8 @@ FILES = ["bdd_supervised.py", "bdd_softteacher.py", "bdd_reliability.py"]
 def inspect():
     configurations = {}
     for name in FILES:
-        cfg = Config.fromfile(str(BASE / "configs" / name))
+        cfg = Config.fromfile(str(BASE / "configs" / name),
+                              import_custom_modules=False)
         model = cfg.model
         klass = model.get("type")
         expected_type = {
