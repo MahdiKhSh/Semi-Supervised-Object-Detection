@@ -482,7 +482,7 @@ def train(args):
                 # The same pseudo boxes are transformed with each student's image.
                 rng = random.Random(args.seed * 7103 + step * 61 + 3)
                 augmented = []
-                for img, target, p in zip(originals, batch_u, pseudo):
+                for img, (_, target), p in zip(originals, batch_u, pseudo):
                     flip = rng.random() < 0.5
                     brightness = rng.uniform(0.75, 1.25)
                     contrast = rng.uniform(0.75, 1.25)
