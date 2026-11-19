@@ -26,6 +26,8 @@ def test_coco_unlabeled_has_no_annotations():
     obj = bdd.convert([_record(1)], include_annotations=False)
     assert len(obj["images"]) == 1 and obj["annotations"] == []
     assert len(obj["categories"]) == 10
+    assert obj["info"]["description"]
+    assert "licenses" in obj
 
 
 def test_boxes_and_duplicate_rejection():

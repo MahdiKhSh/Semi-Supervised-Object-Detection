@@ -41,7 +41,8 @@ def convert(records, include_annotations=True):
             annotations.append({"id": len(annotations) + 1, "image_id": image_id,
                                 "category_id": CAT2ID[cls], "bbox": [x1, y1, x2-x1, y2-y1],
                                 "area": (x2-x1)*(y2-y1), "iscrowd": 0})
-    return {"images": images, "annotations": annotations,
+    return {"info": {"description": "BDD100K RGB 2D detection COCO conversion"},
+            "licenses": [], "images": images, "annotations": annotations,
             "categories": [{"id": idx, "name": name} for name, idx in CAT2ID.items()]}
 
 
