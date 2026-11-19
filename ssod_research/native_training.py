@@ -147,10 +147,12 @@ def pseudo_targets(teacher, images, *, variant, threshold, min_quality,
             if len(boxes) and len(b_boxes):
                 overlap = box_iou(boxes, b_boxes)
                 overlap[labels[:, None] != repeated[i]["labels"][None, :]] = -1
+                # Transfer the IoU matrix once instead of synchronizing CUDA per pair.
+                agreement = overlap.detach().cpu().numpy()
                 # Greedy unique assignment avoids one repeated box matching many.
                 matches = sorted(
-                    ((float(overlap[a, b]), a, b) for a in range(len(boxes))
-                     for b in range(len(b_boxes)) if float(overlap[a, b]) >= agreement_iou),
+                    ((float(agreement[a, b]), a, b) for a in range(len(boxes))
+                     for b in range(len(b_boxes)) if agreement[a, b] >= agreement_iou),
                     reverse=True)
                 seen_a, seen_b = set(), set()
                 for match_iou, a, b in matches:

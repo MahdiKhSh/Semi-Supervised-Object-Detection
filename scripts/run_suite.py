@@ -124,7 +124,7 @@ def generate_jobs(args):
 
 
 def prepare_smoke_inputs(args):
-    from scripts.make_synthetic_bdd import create
+    from make_synthetic_bdd import create
     source = args.output / "synthetic_source"
     paths = create(source, seed=42)
     args.train_labels = Path(paths["train_labels"])
