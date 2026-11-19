@@ -369,6 +369,12 @@ def parse_args(argv=None):
 def train(args):
     out = Path(args.output).resolve()
     out.mkdir(parents=True, exist_ok=True)
+    previous_metadata = {}
+    previous_manifest = out / "manifest.json"
+    if args.resume and previous_manifest.is_file():
+        previous_metadata = json.loads(previous_manifest.read_text(encoding="utf8"))
+    if not args.resume and (out / "last.pth").exists():
+        raise RuntimeError("Existing results found. Choose a new --output instead of overwriting measurements.")
     seed_all(args.seed)
     device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available()
                           else "cpu" if args.device == "auto" else args.device)
@@ -457,8 +463,25 @@ def train(args):
         optimizer.load_state_dict(state["optimizer"])
         scaler.load_state_dict(state["scaler"])
         start = int(state["step"])
+        if start > args.steps:
+            raise RuntimeError("Saved checkpoint is already beyond requested step budget")
         print(f"Resuming at step {start}")
     step_log = out / "steps.jsonl"
+    if start > 0:
+        # Roll log files back to the last *committed checkpoint*, preventing
+        # duplicate optimizer-step entries after interruption and restart.
+        for path in (step_log, out / "evaluations.jsonl"):
+            if not path.is_file():
+                continue
+            kept = []
+            for line in path.read_text(encoding="utf8").splitlines():
+                if line.strip():
+                    item = json.loads(line)
+                    if int(item.get("step", -1)) <= start:
+                        kept.append(line)
+            path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf8")
+    previous_seconds = float(previous_metadata.get("elapsed_seconds") or 0)
+    previous_peak = float(previous_metadata.get("gpu_peak_reserved_gib") or 0)
     started = time.monotonic()
     try:
         for step in range(start, args.steps):
@@ -558,9 +581,9 @@ def train(args):
         raise
     finally:
         metadata["ended_utc"] = datetime.now(timezone.utc).isoformat()
-        metadata["elapsed_seconds"] = round(time.monotonic()-started, 2)
+        metadata["elapsed_seconds"] = round(previous_seconds + time.monotonic()-started, 2)
         if device.type == "cuda":
-            metadata["gpu_peak_reserved_gib"] = round(torch.cuda.max_memory_reserved() / 2**30, 3)
+            metadata["gpu_peak_reserved_gib"] = round(max(previous_peak, torch.cuda.max_memory_reserved() / 2**30), 3)
         (out / "manifest.json").write_text(json.dumps(metadata, indent=2, default=str), encoding="utf8")
 
 
