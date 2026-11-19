@@ -11,7 +11,7 @@ def test_plan_matrices_have_warmup_and_unique_names(tmp_path):
         assert sum(x["type"] == "prepare" for x in jobs) == (6 if preset == "paper" else 1)
         assert sum("warmup" in x["name"] for x in jobs) == (6 if preset == "paper" else 1)
         assert any("--variant" in x["command"] and "full" in x["command"] for x in jobs)
-        assert any("/supervised" in x["name"] for x in jobs)
+        assert any("--variant" in x["command"] and "supervised" in x["command"] for x in jobs)
         for job in jobs:
             if job["type"] == "train" and "warmup" not in job["name"]:
                 assert "--init-checkpoint" in job["command"]
