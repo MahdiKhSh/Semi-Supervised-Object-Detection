@@ -302,7 +302,9 @@ def evaluate(model, val_data, device, output_dir, *, max_images=None):
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "detections.json").write_text(json.dumps(predictions), encoding="utf8")
     if not predictions:
-        return {"AP": 0.0, "AP50": 0.0, "AP75": 0.0, "images": len(id_set),
+        return {"AP": 0.0, "AP50": 0.0, "AP75": 0.0,
+                "AP_small": 0.0, "AP_medium": 0.0, "AP_large": 0.0,
+                "images": len(id_set),
                 "seconds": round(time.monotonic()-started, 2),
                 "notice": "no predicted detections"}
     with contextlib.redirect_stdout(io.StringIO()):
@@ -313,7 +315,9 @@ def evaluate(model, val_data, device, output_dir, *, max_images=None):
         evaluator.accumulate()
         evaluator.summarize()
     return {"AP": float(evaluator.stats[0]), "AP50": float(evaluator.stats[1]),
-            "AP75": float(evaluator.stats[2]), "images": len(id_set),
+            "AP75": float(evaluator.stats[2]),
+            "AP_small": float(evaluator.stats[3]), "AP_medium": float(evaluator.stats[4]),
+            "AP_large": float(evaluator.stats[5]), "images": len(id_set),
             "seconds": round(time.monotonic()-started, 2)}
 
 

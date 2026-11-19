@@ -237,6 +237,8 @@ def summarize(root):
                 "condition_offset": args.get("condition_offset"),
                 "final_step": last.get("step"),
                 "AP": last.get("AP"), "AP50": last.get("AP50"), "AP75": last.get("AP75"),
+                "AP_small": last.get("AP_small"), "AP_medium": last.get("AP_medium"),
+                "AP_large": last.get("AP_large"),
                 "partial_validation": last.get("partial_validation"),
                 "elapsed_seconds": metadata.get("elapsed_seconds"),
                 "gpu_peak_reserved_gib": metadata.get("gpu_peak_reserved_gib"),
