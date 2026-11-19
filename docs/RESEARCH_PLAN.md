@@ -48,3 +48,12 @@ in clean-condition AP?
 - COCO-style annotations alone do not fully encode BDD weather/time metadata.
 - CUDA/C++ MMCV wheel availability for RTX 5090 has not been tested.
 - Some MMDetection versions may require minor config adaptation.
+
+## Warm-start fairness
+
+A random detection head produces few useful initial pseudo-labels. The native
+suite first trains a supervised warmup for each fraction/seed, then initializes
+ALL comparison variants (including supervised-only continuation) from the
+same warmup checkpoint. Results must state warmup + continuation compute
+and never confuse ImageNet backbone initialization with a COCO pretrained
+full detector. Threshold sweeps reuse the identical supervised warm start.
