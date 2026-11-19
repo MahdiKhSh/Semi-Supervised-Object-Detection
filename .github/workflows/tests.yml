@@ -27,3 +27,17 @@ jobs:
           git -C third_party/mmdetection checkout cfd5d3a985b0249de009b67d04f37263e11cdf3d
       - name: Resolve proposed MMDetection configs
         run: python scripts/check_configs.py
+
+  torch-gradients:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install CPU PyTorch and unit-test dependencies
+        run: |
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e ".[dev]"
+      - name: Check differentiable loss and autograd
+        run: python -m pytest -q tests/test_consistency.py
