@@ -232,12 +232,20 @@ def main(argv=None):
         with log.open("a", encoding="utf8") as out:
             out.write("\nCOMMAND: " + subprocess.list2cmdline(job["command"]) + "\n")
             out.flush()
-            process = subprocess.run(job["command"], cwd=ROOT,
-                                     stdout=out, stderr=subprocess.STDOUT, check=False)
+            process = subprocess.Popen(
+                job["command"], cwd=ROOT, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, encoding="utf8", errors="replace",
+                text=True, bufsize=1)
+            assert process.stdout is not None
+            for line in process.stdout:
+                out.write(line)
+                out.flush()
+                print(line, end="", flush=True)
+            return_code = process.wait()
         summarize(args.output)
-        if process.returncode:
-            print(f"FAILED: {job['name']} (exit {process.returncode}). See {log}", file=sys.stderr, flush=True)
-            raise SystemExit(process.returncode)
+        if return_code:
+            print(f"FAILED: {job['name']} (exit {return_code}). See {log}", file=sys.stderr, flush=True)
+            raise SystemExit(return_code)
         print(f"COMPLETE: {job['name']}", flush=True)
         completed += 1
         if args.run_limit > 0 and completed >= args.run_limit:
