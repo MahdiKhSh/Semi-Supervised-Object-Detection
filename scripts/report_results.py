@@ -54,17 +54,24 @@ def stats_for_rows(rows):
                         "std_AP": stdev(scores) if len(scores) > 1 else None,
                         "seeds": sorted(int(s) for s, _ in vals)})
     comparisons = []
+    comparison_pairs = (
+        ("full", "supervised"),
+        ("full", "mean_teacher"),
+        ("care_ssod", "supervised"),
+        ("care_ssod", "mean_teacher"),
+        ("care_ssod", "full"),
+    )
     for fraction in sorted({p for p, _ in groups}):
-        for baseline in ("supervised", "mean_teacher"):
+        for candidate, baseline in comparison_pairs:
             diffs = []
             for (fr, seed), by_name in paired.items():
-                if fr == fraction and "full" in by_name and baseline in by_name:
-                    diffs.append((seed, by_name["full"] - by_name[baseline]))
+                if fr == fraction and candidate in by_name and baseline in by_name:
+                    diffs.append((seed, by_name[candidate] - by_name[baseline]))
             if not diffs:
                 continue
             delta = [d for _, d in diffs]
             comparisons.append({
-                "fraction": fraction, "comparison": "full_minus_" + baseline,
+                "fraction": fraction, "comparison": f"{candidate}_minus_{baseline}",
                 "n_pairs": len(delta), "paired_mean_delta_AP": mean(delta),
                 "paired_std_delta_AP": stdev(delta) if len(delta) > 1 else None,
                 "bootstrap_95_ci": bootstrap_ci(delta),

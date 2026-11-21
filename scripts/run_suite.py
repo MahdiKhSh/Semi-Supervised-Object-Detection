@@ -64,6 +64,7 @@ def _default_output_for_preset(preset: str) -> Path:
         "smoke": ROOT / "work_dirs" / "smoke",
         "pilot": ROOT / "work_dirs" / "pilot_runs",
         "core": ROOT / "work_dirs" / "core_runs",
+        "care": ROOT / "work_dirs" / "care_runs",
         "paper": ROOT / "work_dirs" / "paper_runs",
     }
     return mapping.get(preset, ROOT / "work_dirs" / f"{preset}_runs")
@@ -71,7 +72,9 @@ def _default_output_for_preset(preset: str) -> Path:
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Crash-safe resumable SSOD research orchestrator")
-    p.add_argument("--preset", choices=("smoke", "pilot", "core", "paper"), default="paper")
+    p.add_argument("--preset", choices=("smoke", "pilot", "core", "care", "paper"), default="paper")
+    p.add_argument("--include-care", action="store_true",
+                   help="Append proposed CaRe-SSOD variant to smoke/pilot/core/paper presets")
     p.add_argument("--train-labels", type=Path, default=ROOT / "data/bdd100k/raw/labels_train.json")
     p.add_argument("--val-labels", type=Path, default=ROOT / "data/bdd100k/raw/labels_val.json")
     p.add_argument("--train-images", type=Path, default=ROOT / "data/bdd100k/images/train")
@@ -191,6 +194,19 @@ def experiment_plan(preset, train_steps=None, warmup_steps=None, max_side=None):
             ("full", 0.7, "no_extra_consistency", {"consistency_weight": 0.0}),
         ]
         return specs, selected, warmup_steps or 1000, train_steps or 3000, max_side or 512
+    if preset == "care":
+        specs = tuple((f, s) for f in PAPER_FRACTIONS for s in PAPER_SEEDS)
+        selected = [
+            ("supervised", 0.7, "supervised", {}),
+            ("mean_teacher", 0.7, "mean_teacher", {}),
+            ("full", 0.7, "full", {}),
+            ("care_ssod", 0.7, "care_ssod", {}),
+            ("care_ssod", 0.7, "care_no_trizone", {"care_tri_zone": 0}),
+            ("care_ssod", 0.7, "care_no_nwd", {"care_nwd": 0}),
+            ("care_ssod", 0.7, "care_no_vis_cal", {"care_visibility_cal": 0}),
+            ("care_ssod", 0.7, "care_no_cutout", {"care_cutout": 0}),
+        ]
+        return specs, selected, warmup_steps or 1000, train_steps or 3000, max_side or 512
     specs = tuple((f, s) for f in PAPER_FRACTIONS for s in PAPER_SEEDS)
     selected = [(v, 0.7, v, {}) for v in VARIANTS]
     selected += [
@@ -212,7 +228,7 @@ def _default_save_every(preset: str, override: int | None) -> int:
         return max(1, int(override))
     if preset == "paper":
         return 250
-    if preset == "core":
+    if preset in ("core", "care"):
         return 200
     return 10
 
@@ -221,6 +237,8 @@ def generate_jobs(args):
     """Return the canonical ordered primary jobs (prepare + train) for a preset."""
     specs, variants, warmup_steps, train_steps, side = experiment_plan(
         args.preset, args.train_steps, args.warmup_steps, args.max_side)
+    if getattr(args, "include_care", False) and not any(v[0] == "care_ssod" for v in variants):
+        variants = list(variants) + [("care_ssod", 0.7, "care_ssod", {})]
     if not 0 < warmup_steps < 10_000_000 or not 0 < train_steps < 10_000_000:
         raise ValueError("step budgets must be positive")
     save_every = _default_save_every(args.preset, getattr(args, "save_every", None))
@@ -291,7 +309,11 @@ def generate_jobs(args):
         init = warmup_output / "last.pth"
         for variant, threshold, tag, kw in variants:
             if args.preset == "core" and seed != 42 and tag not in (
-                "supervised", "mean_teacher", "reliability", "full"
+                "supervised", "mean_teacher", "reliability", "full", "care_ssod"
+            ):
+                continue
+            if args.preset == "care" and seed != 42 and tag not in (
+                "supervised", "mean_teacher", "full", "care_ssod"
             ):
                 continue
             output = root / tag
@@ -495,7 +517,7 @@ def build_pipeline_dag(args, jobs: list[dict] | None = None) -> PipelineDAG:
         order += 1
 
         # Per-class and condition-stratified evaluation stage for core & paper
-        if args.preset in ("core", "paper"):
+        if args.preset in ("core", "care", "paper"):
             an_name = f"{job['name']}/analysis"
             an_id = make_experiment_id(args.preset, an_name)
             analysis_ids.append(an_id)
@@ -746,7 +768,7 @@ def summarize(root):
 
 
 def analyze_final(job, args):
-    if job["type"] == "train" and args.preset in ("core", "paper"):
+    if job["type"] == "train" and args.preset in ("core", "care", "paper"):
         final_predictions = Path(job["output"]) / f"eval_{job['steps']:07d}" / "detections.json"
         if not final_predictions.is_file():
             raise RuntimeError(f"Missing final COCO detections: {final_predictions}")
@@ -1089,7 +1111,7 @@ def _run_reports_and_plots(args, registry: ExperimentRegistry, dag: PipelineDAG,
             runtime_delta_sec=time.monotonic() - t0,
         )
 
-    if args.preset in ("core", "paper"):
+    if args.preset in ("core", "care", "paper"):
         t1 = time.monotonic()
         from plot_results import render
         fig_dir = render(args.output)

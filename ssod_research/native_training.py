@@ -37,6 +37,12 @@ from torchvision.models import ResNet50_Weights
 from torchvision.models.detection import fasterrcnn_resnet50_fpn
 from torchvision.ops import box_iou
 
+from ssod_research.care_ssod import (
+    OnlineVisibilityClassCalibrator,
+    care_unsupervised_loss,
+    extract_teacher_tri_zone_targets,
+    strong_view_care,
+)
 from ssod_research.consistency import weighted_consistency_loss
 from ssod_research.native_data import RoadCocoDataset, image_inventory_check, strong_view
 from ssod_research.recovery import (
@@ -66,7 +72,7 @@ BDD_CLASSES = (
     "background", "pedestrian", "rider", "car", "truck", "bus",
     "train", "motorcycle", "bicycle", "traffic light", "traffic sign",
 )
-VARIANTS = ("supervised", "mean_teacher", "reliability", "adaptive", "condition", "full")
+VARIANTS = ("supervised", "mean_teacher", "reliability", "adaptive", "condition", "full", "care_ssod")
 
 _NON_IDENTITY_KEYS = frozenset({
     "output", "data_root", "train_images", "val_images", "init_checkpoint",
@@ -306,7 +312,8 @@ def consistency_roi_loss(model, images, pseudo_targets_list, *,
     return weighted_consistency_loss(
         logits, chosen, gt, labels, scores, uncertainty,
         box_weight=box_weight, class_weight=class_weight,
-        confidence_weight=confidence_weight, reliability_scale=reliability_scale)
+        confidence_weight=confidence_weight, reliability_scale=reliability_scale,
+        background_index=0)
 
 
 def target_for_training(pseudo, *, image_id):
@@ -554,6 +561,14 @@ def parse_args(argv=None):
     p.add_argument("--box-weight", type=float, default=1.0)
     p.add_argument("--class-weight", type=float, default=1.0)
     p.add_argument("--confidence-weight", type=float, default=0.25)
+    p.add_argument("--care-tri-zone", type=int, choices=(0, 1), default=1)
+    p.add_argument("--care-nwd", type=int, choices=(0, 1), default=1)
+    p.add_argument("--care-visibility-cal", type=int, choices=(0, 1), default=1)
+    p.add_argument("--care-cutout", type=int, choices=(0, 1), default=1)
+    p.add_argument("--care-giou-weight", type=float, default=0.5)
+    p.add_argument("--care-kl-z1-weight", type=float, default=0.5)
+    p.add_argument("--care-kl-z2-weight", type=float, default=0.35)
+    p.add_argument("--care-temperature", type=float, default=2.0)
     p.add_argument("--eval-every", type=int, default=200)
     p.add_argument("--save-every", type=int, default=100)
     p.add_argument("--keep-checkpoints", type=int, default=2)
@@ -692,6 +707,14 @@ def _train_locked(args, out: Path):
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and amp_mode == "fp16"))
 
     running_stats = {"total_candidates": 0, "total_accepted": 0, "total_quality_sum": 0.0}
+    care_calibrator = (
+        OnlineVisibilityClassCalibrator(
+            num_foreground_classes=len(BDD_CLASSES) - 1,
+            base_threshold=args.pseudo_threshold,
+        )
+        if args.variant == "care_ssod"
+        else None
+    )
     start = 0
     resume_mode = "fresh"
     resume_warnings: list[str] = []
@@ -739,6 +762,11 @@ def _train_locked(args, out: Path):
             if isinstance(alg, dict):
                 if isinstance(alg.get("running_stats"), dict):
                     running_stats.update(alg["running_stats"])
+                if care_calibrator is not None:
+                    if isinstance(alg.get("care_calibrator"), dict):
+                        care_calibrator.load_state_dict(alg["care_calibrator"])
+                    else:
+                        resume_warnings.append("care_ssod online calibrator state missing")
             else:
                 resume_warnings.append("algorithm mutable state missing")
 
@@ -898,6 +926,7 @@ def _train_locked(args, out: Path):
                 "condition_offset": float(args.condition_offset),
                 "class_counts": counts,
                 "running_stats": dict(running_stats),
+                "care_calibrator": care_calibrator.state_dict() if care_calibrator is not None else None,
             },
             "metrics_state": {
                 "elapsed_seconds": elapsed_total,
@@ -980,7 +1009,52 @@ def _train_locked(args, out: Path):
                 total = supervised
             extra = {"sup": float(supervised.detach()), "unsup": 0.0, "stability": 0.0,
                      "candidates": 0, "accepted": 0}
-            if teacher is not None:
+            if teacher is not None and args.variant == "care_ssod":
+                ids = sample_indices(len(unlabeled), args.batch_size, args.seed, step, 1)
+                batch_u = cpu_batch(unlabeled, ids)
+                originals = [img.to(device) for img, _ in batch_u]
+                tri_outputs, statistics = extract_teacher_tri_zone_targets(
+                    teacher,
+                    originals,
+                    care_calibrator,
+                    use_nwd=bool(args.care_nwd),
+                    use_visibility_calibration=bool(args.care_visibility_cal),
+                    use_tri_zone=bool(args.care_tri_zone),
+                )
+                extra.update(statistics)
+                running_stats["total_candidates"] += int(statistics.get("candidates", 0))
+                running_stats["total_accepted"] += int(statistics.get("accepted", 0))
+                running_stats["total_quality_sum"] += float(statistics.get("quality_sum", 0.0))
+
+                rng = random.Random(args.seed * 7103 + step * 61 + 3)
+                aug_images, z1_targets, z1_meta, z2_meta = [], [], [], []
+                for img, (_, target), item in zip(originals, batch_u, tri_outputs):
+                    a_img, a_z1, a_z2 = strong_view_care(
+                        img, item["zone1"], item["zone2"],
+                        rng=rng, enable_cutout=bool(args.care_cutout),
+                    )
+                    aug_images.append(a_img)
+                    z1_targets.append(target_for_training(a_z1, image_id=int(target["image_id"])))
+                    z1_meta.append(a_z1)
+                    z2_meta.append(a_z2)
+
+                with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
+                    care_loss, care_extra = care_unsupervised_loss(
+                        model,
+                        aug_images,
+                        z1_targets,
+                        z1_meta,
+                        z2_meta,
+                        use_tri_zone=bool(args.care_tri_zone),
+                        giou_weight=float(args.care_giou_weight),
+                        kl_zone1_weight=float(args.care_kl_z1_weight),
+                        kl_zone2_weight=float(args.care_kl_z2_weight),
+                        temperature=float(args.care_temperature),
+                    )
+                    if care_loss is not None:
+                        total = total + args.unsup_weight * care_loss
+                    extra.update(care_extra)
+            elif teacher is not None:
                 ids = sample_indices(len(unlabeled), args.batch_size, args.seed, step, 1)
                 batch_u = cpu_batch(unlabeled, ids)
                 originals = [img.to(device) for img, _ in batch_u]

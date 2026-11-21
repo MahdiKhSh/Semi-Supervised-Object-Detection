@@ -50,3 +50,13 @@ and cross-GPU portable execution architecture.
 
 - **Decision**: GitHub tracks ONLY lightweight artifacts under `results/<preset>/` (`results.csv`, `results.json`, `statistics.json`, `PAPER_RESULTS.md`, `progress.json`, `runtime_estimates.json`, `figures/*.png`, per-class/condition JSONs) and `docs/` (`PROJECT_PROGRESS.md`, `CODEX_HANDOFF.md`, `DECISIONS.md`).
 - **Never committed**: `.pth`/`.pt`/`.ckpt` checkpoints, SQLite databases, `work_dirs/`, or raw BDD100K images/labels. Network/GitHub push failures are retried with backoff and never abort training.
+
+## 9. Critical Consistency Bug Fix & CaRe-SSOD Proposed Method (`ssod_research/care_ssod.py`)
+
+- **Critical Bug Fixed (`consistency.py` / `native_training.py`)**: `weighted_consistency_loss` previously assumed MMDetection's last-column background convention (`labels < class_dim - 1`). Under TorchVision's `background = 0`, foreground `1..10` convention, predicting `traffic sign` (`label = 10`) crashed training with `ValueError`. Added explicit `background_index` (`-1` default for MMDet, `0` for TorchVision).
+- **Proposed Novel Method (`care_ssod`, `--preset care`)**:
+  1. Zero-metadata RGB photometric visibility degradation estimator `d(x)` (replaces unlabeled ground-truth weather/time metadata leakage).
+  2. Scale-aware Normalized Gaussian Wasserstein Distance (NWD) + cross-view JS divergence over the teacher's full `(C+1)`-class probability distribution (fixes small-object rejection for traffic lights/signs/pedestrians).
+  3. Online dual-axis (class x visibility) EMA threshold calibrator (saved in checkpoints for exact deterministic resume).
+  4. Tri-Zone reliability partitioning with single-pass FPN feature-shared Ambiguity-Zone background proposal suppression + aligned reliability-weighted GIoU and temperature-scaled KL soft distillation (eliminates hard-negative background poisoning, conflicting CE-vs-MSE losses, and redundant double student backbone forward passes).
+- **Scientific Claim Discipline**: All baselines (`supervised`, `mean_teacher`, `full`) remain untouched for matched comparison; publication claims require measured multi-seed BDD100K gains from `--preset care`.

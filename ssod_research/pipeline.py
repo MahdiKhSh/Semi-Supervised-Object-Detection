@@ -51,7 +51,7 @@ def classify_training_stage(variant: str, tag: str) -> str:
         return "supervised_warmup"
     if tag.startswith("threshold"):
         return "threshold_experiment"
-    if tag.startswith("no_"):
+    if tag.startswith("no_") or "_no_" in tag:
         return "ablation_experiment"
     if variant == "supervised":
         return "baseline_training"

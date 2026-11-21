@@ -13,13 +13,17 @@ import torch.nn.functional as F
 def weighted_consistency_loss(
     class_logits, pred_boxes, pseudo_boxes, pseudo_labels, pseudo_scores,
     localization_uncertainty, *, box_weight=1.0, class_weight=1.0,
-    confidence_weight=0.25, reliability_scale=4.0, eps=1e-6
+    confidence_weight=0.25, reliability_scale=4.0, background_index=-1, eps=1e-6
 ):
     """Return independent differentiable scalar losses.
 
-    class_logits: (N,C+1) with background in the last column.
+    class_logits: (N,C+1).
+      - ``background_index=-1`` (MMDetection convention): background is the
+        last column (``C``), foreground labels are in ``[0, C)``.
+      - ``background_index=0`` (TorchVision convention): background is column
+        ``0``, foreground labels are in ``[1, C]``.
     pred_boxes and pseudo_boxes: (N,4) xyxy in *same augmented image space*.
-    labels: (N,) integers in [0,C); scores and uncertainty: (N,).
+    scores and uncertainty: (N,).
     Local box deltas are normalized by pseudo box width and height.
     """
     if class_logits.ndim != 2 or pred_boxes.ndim != 2 or pred_boxes.shape[-1] != 4:
@@ -27,6 +31,9 @@ def weighted_consistency_loss(
     n, class_dim = class_logits.shape
     if class_dim < 2 or pred_boxes.shape[0] != n:
         raise ValueError("batch and class dimensions must agree")
+    bg_idx = background_index if background_index >= 0 else class_dim + background_index
+    if not 0 <= bg_idx < class_dim:
+        raise ValueError(f"invalid background_index {background_index} for class_dim={class_dim}")
     labels = pseudo_labels.long().detach().reshape(-1)
     scores = pseudo_scores.detach().reshape(-1).float()
     uncertainty = localization_uncertainty.detach().reshape(-1).float()
@@ -37,7 +44,7 @@ def weighted_consistency_loss(
         zero = class_logits.sum() * 0.0 + pred_boxes.sum() * 0.0
         return {"loss_stability_box": zero, "loss_stability_class": zero,
                 "loss_stability_confidence": zero}
-    if bool(((labels < 0) | (labels >= class_dim-1)).any()):
+    if bool(((labels < 0) | (labels >= class_dim) | (labels == bg_idx)).any()):
         raise ValueError("invalid foreground pseudo label")
     if reliability_scale < 0 or any(v < 0 for v in (box_weight, class_weight, confidence_weight)):
         raise ValueError("loss weights must be nonnegative")
