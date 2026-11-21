@@ -65,6 +65,8 @@ def _default_output_for_preset(preset: str) -> Path:
         "pilot": ROOT / "work_dirs" / "pilot_runs",
         "core": ROOT / "work_dirs" / "core_runs",
         "care": ROOT / "work_dirs" / "care_runs",
+        "q1_pilot": ROOT / "work_dirs" / "q1_pilot_runs",
+        "q1_paper": ROOT / "work_dirs" / "q1_paper_runs",
         "paper": ROOT / "work_dirs" / "paper_runs",
     }
     return mapping.get(preset, ROOT / "work_dirs" / f"{preset}_runs")
@@ -72,9 +74,13 @@ def _default_output_for_preset(preset: str) -> Path:
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Crash-safe resumable SSOD research orchestrator")
-    p.add_argument("--preset", choices=("smoke", "pilot", "core", "care", "paper"), default="paper")
+    p.add_argument(
+        "--preset",
+        choices=("smoke", "pilot", "core", "care", "q1_pilot", "q1_paper", "paper"),
+        default="paper",
+    )
     p.add_argument("--include-care", action="store_true",
-                   help="Append proposed CaRe-SSOD variant to smoke/pilot/core/paper presets")
+                   help="Append proposed CaRe-SSOD / CoRe-SSOD variant to legacy presets")
     p.add_argument("--train-labels", type=Path, default=ROOT / "data/bdd100k/raw/labels_train.json")
     p.add_argument("--val-labels", type=Path, default=ROOT / "data/bdd100k/raw/labels_val.json")
     p.add_argument("--train-images", type=Path, default=ROOT / "data/bdd100k/images/train")
@@ -83,7 +89,16 @@ def parse_args(argv=None):
     p.add_argument("--warmup-steps", type=int, default=None)
     p.add_argument("--train-steps", type=int, default=None)
     p.add_argument("--max-side", type=int, default=None)
-    p.add_argument("--batch-size", type=int, default=1)
+    p.add_argument("--batch-size", type=int, default=None)
+    p.add_argument("--grad-accum-steps", type=int, default=None)
+    p.add_argument("--detector", choices=("fasterrcnn_v1", "fasterrcnn_v2"), default=None)
+    p.add_argument("--lr", type=float, default=None)
+    p.add_argument(
+        "--lr-schedule",
+        choices=("constant", "multistep", "cosine", "warmup_cosine", "warmup_multistep"),
+        default=None,
+    )
+    p.add_argument("--lr-warmup-steps", type=int, default=None)
     p.add_argument("--save-every", type=int, default=None)
     p.add_argument("--amp", choices=("auto", "off", "fp16", "bf16"), default="auto")
     p.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
@@ -126,12 +141,31 @@ def parse_args(argv=None):
             for key in ("train_labels", "val_labels", "train_images", "val_images"):
                 if saved_args.get(key):
                     setattr(args, key, Path(saved_args[key]))
-            for key in ("device", "amp", "batch_size", "warmup_steps", "train_steps", "max_side", "save_every"):
-                if saved_args.get(key) is not None and getattr(args, key) in (None, "auto", 1):
+            for key in (
+                "device", "amp", "batch_size", "grad_accum_steps", "detector",
+                "lr", "lr_schedule", "lr_warmup_steps",
+                "warmup_steps", "train_steps", "max_side", "save_every",
+            ):
+                if saved_args.get(key) is not None and getattr(args, key) in (None, "auto"):
                     setattr(args, key, saved_args[key])
             if args.sync_dir is None and saved_args.get("sync_dir"):
                 args.sync_dir = Path(saved_args["sync_dir"])
         args.resume = True
+
+    # Apply preset-aware defaults (safe on Kaggle T4 16GB and portable to RTX 5090 / L40s)
+    is_q1 = args.preset in ("q1_pilot", "q1_paper")
+    if args.batch_size is None:
+        args.batch_size = 2 if is_q1 else 1
+    if args.grad_accum_steps is None:
+        args.grad_accum_steps = 4 if is_q1 else 1  # effective batch = 8 for q1 presets!
+    if args.detector is None:
+        args.detector = "fasterrcnn_v2" if is_q1 else "fasterrcnn_v1"
+    if args.lr is None:
+        args.lr = 0.01 if is_q1 else 0.003
+    if args.lr_schedule is None:
+        args.lr_schedule = "warmup_cosine" if is_q1 else "constant"
+    if args.lr_warmup_steps is None:
+        args.lr_warmup_steps = 500 if args.preset == "q1_paper" else (150 if args.preset == "q1_pilot" else 0)
 
     if args.output is None:
         args.output = _default_output_for_preset(args.preset)
@@ -207,6 +241,32 @@ def experiment_plan(preset, train_steps=None, warmup_steps=None, max_side=None):
             ("care_ssod", 0.7, "care_no_cutout", {"care_cutout": 0}),
         ]
         return specs, selected, warmup_steps or 1000, train_steps or 3000, max_side or 512
+    if preset == "q1_pilot":
+        specs = ((0.10, 42),)
+        selected = [
+            ("supervised", 0.7, "supervised", {}),
+            ("mean_teacher", 0.7, "mean_teacher", {}),
+            ("soft_teacher", 0.7, "soft_teacher", {}),
+            ("consistent_teacher", 0.7, "consistent_teacher", {}),
+            ("core_ssod", 0.7, "core_ssod", {}),
+        ]
+        return specs, selected, warmup_steps or 500, train_steps or 1500, max_side or 800
+    if preset == "q1_paper":
+        specs = tuple((f, s) for f in PAPER_FRACTIONS for s in PAPER_SEEDS)
+        selected = [
+            ("supervised", 0.7, "supervised", {}),
+            ("mean_teacher", 0.7, "mean_teacher", {}),
+            ("soft_teacher", 0.7, "soft_teacher", {}),
+            ("consistent_teacher", 0.7, "consistent_teacher", {}),
+            ("core_ssod", 0.7, "core_ssod", {}),
+            ("care_ssod", 0.7, "care_ssod", {}),
+            ("core_ssod", 0.7, "core_no_vis_weight", {"conformal_vis_weight": 0}),
+            ("core_ssod", 0.7, "core_no_trizone", {"care_tri_zone": 0}),
+            ("core_ssod", 0.7, "core_no_nwd", {"care_nwd": 0}),
+            ("core_ssod", 0.7, "core_alpha005", {"conformal_alpha_strict": 0.05}),
+            ("core_ssod", 0.7, "core_alpha025", {"conformal_alpha_strict": 0.25}),
+        ]
+        return specs, selected, warmup_steps or 3000, train_steps or 12000, max_side or 800
     specs = tuple((f, s) for f in PAPER_FRACTIONS for s in PAPER_SEEDS)
     selected = [(v, 0.7, v, {}) for v in VARIANTS]
     selected += [
@@ -226,9 +286,9 @@ def experiment_plan(preset, train_steps=None, warmup_steps=None, max_side=None):
 def _default_save_every(preset: str, override: int | None) -> int:
     if override is not None:
         return max(1, int(override))
-    if preset == "paper":
+    if preset in ("paper", "q1_paper"):
         return 250
-    if preset in ("core", "care"):
+    if preset in ("core", "care", "q1_pilot"):
         return 200
     return 10
 
@@ -237,14 +297,19 @@ def generate_jobs(args):
     """Return the canonical ordered primary jobs (prepare + train) for a preset."""
     specs, variants, warmup_steps, train_steps, side = experiment_plan(
         args.preset, args.train_steps, args.warmup_steps, args.max_side)
-    if getattr(args, "include_care", False) and not any(v[0] == "care_ssod" for v in variants):
-        variants = list(variants) + [("care_ssod", 0.7, "care_ssod", {})]
+    if getattr(args, "include_care", False) and not any(v[0] == "core_ssod" for v in variants):
+        variants = list(variants) + [("core_ssod", 0.7, "core_ssod", {})]
     if not 0 < warmup_steps < 10_000_000 or not 0 < train_steps < 10_000_000:
         raise ValueError("step budgets must be positive")
     save_every = _default_save_every(args.preset, getattr(args, "save_every", None))
     amp_arg = getattr(args, "amp", "auto")
     if args.device == "cpu":
         amp_arg = "off"
+    eval_every = (
+        str(train_steps)
+        if args.preset in ("smoke", "pilot", "q1_pilot")
+        else ("3000" if args.preset == "q1_paper" else "2000")
+    )
     jobs = []
     for fraction, seed in specs:
         frac_tag = f"{round(100 * fraction):02d}pct"
@@ -255,17 +320,24 @@ def generate_jobs(args):
             "--train-images", str(args.train_images),
             "--val-images", str(args.val_images),
             "--device", args.device,
+            "--detector", str(getattr(args, "detector", "fasterrcnn_v1")),
             "--batch-size", str(args.batch_size),
+            "--grad-accum-steps", str(getattr(args, "grad_accum_steps", 1)),
             "--max-side", str(side),
+            "--lr", str(getattr(args, "lr", 0.003)),
+            "--lr-schedule", str(getattr(args, "lr_schedule", "constant")),
+            "--lr-warmup-steps", str(getattr(args, "lr_warmup_steps", 0)),
             "--seed", str(seed),
             "--save-every", str(save_every),
-            "--eval-every", str(train_steps) if args.preset in ("smoke", "pilot") else "2000",
+            "--eval-every", eval_every,
             "--amp", amp_arg,
         ]
         if args.preset == "smoke":
             base += ["--no-pretrained-backbone", "--eval-max-images", "4"]
         elif args.preset == "pilot":
             base += ["--eval-max-images", "50"]
+        elif args.preset == "q1_pilot":
+            base += ["--eval-max-images", "500"]
         prepare_cmd = [
             sys.executable, str(ROOT / "scripts" / "prepare_bdd100k.py"),
             "--train-labels", str(args.train_labels),
@@ -314,6 +386,10 @@ def generate_jobs(args):
                 continue
             if args.preset == "care" and seed != 42 and tag not in (
                 "supervised", "mean_teacher", "full", "care_ssod"
+            ):
+                continue
+            if args.preset == "q1_paper" and seed != 42 and tag not in (
+                "supervised", "mean_teacher", "soft_teacher", "consistent_teacher", "core_ssod"
             ):
                 continue
             output = root / tag
@@ -461,11 +537,15 @@ def build_pipeline_dag(args, jobs: list[dict] | None = None) -> PipelineDAG:
         sci_cfg = {
             "variant": job["variant"],
             "tag": tag,
+            "detector": str(getattr(args, "detector", "fasterrcnn_v1")),
             "seed": int(job["seed"]),
             "fraction": float(job["fraction"]),
             "threshold": float(job["threshold"]),
-            "batch_size": int(args.batch_size),
+            "effective_batch_size": int(args.batch_size) * int(getattr(args, "grad_accum_steps", 1)),
             "max_side": int(job["max_side"]),
+            "lr": float(getattr(args, "lr", 0.003)),
+            "lr_schedule": str(getattr(args, "lr_schedule", "constant")),
+            "lr_warmup_steps": int(getattr(args, "lr_warmup_steps", 0)),
             "steps": int(job["steps"]),
             "pretrained_backbone": args.preset != "smoke",
             "kwargs": job.get("kwargs", {}),
@@ -517,7 +597,7 @@ def build_pipeline_dag(args, jobs: list[dict] | None = None) -> PipelineDAG:
         order += 1
 
         # Per-class and condition-stratified evaluation stage for core & paper
-        if args.preset in ("core", "care", "paper"):
+        if args.preset in ("core", "care", "q1_paper", "paper"):
             an_name = f"{job['name']}/analysis"
             an_id = make_experiment_id(args.preset, an_name)
             analysis_ids.append(an_id)
@@ -654,19 +734,30 @@ def job_complete(job):
     if not status:
         return False
     saved = status.get("arguments", {})
-    # Check only scientific hyperparameters (NOT machine-local paths like train_images/init_checkpoint
-    # so Kaggle -> RTX 5090 transfers resume cleanly!).
+    # Check only scientific hyperparameters (NOT machine-local paths or micro-batch split
+    # so Kaggle 2x4 -> RTX 5090 4x2 transfers resume cleanly!).
     for flag in (
-        "variant", "seed", "max_side", "batch_size", "pseudo_threshold",
+        "variant", "detector", "seed", "max_side", "pseudo_threshold",
         "box_weight", "class_weight", "confidence_weight",
         "localization_scale", "localization_enabled", "adaptive_strength",
         "condition_offset", "consistency_weight",
+        "conformal_alpha_strict", "conformal_vis_weight",
+        "care_tri_zone", "care_nwd",
     ):
         planned = _flag(job["command"], flag)
         if planned is not None and saved.get(flag) is not None and str(saved.get(flag)) != str(planned):
             raise RuntimeError(
                 f"Run settings changed for {out}: {flag}: "
                 f"{saved.get(flag)} versus {planned}. Use a new output path."
+            )
+    planned_bs = _flag(job["command"], "batch_size")
+    planned_ga = _flag(job["command"], "grad_accum_steps") or "1"
+    if planned_bs is not None and saved.get("batch_size") is not None:
+        saved_eff = int(saved.get("batch_size", 1)) * int(saved.get("grad_accum_steps", 1))
+        planned_eff = int(planned_bs) * int(planned_ga)
+        if saved_eff != planned_eff:
+            raise RuntimeError(
+                f"Effective batch size changed for {out}: {saved_eff} vs {planned_eff}. Use a new output path."
             )
     if status.get("status") != "completed":
         return False
@@ -768,7 +859,7 @@ def summarize(root):
 
 
 def analyze_final(job, args):
-    if job["type"] == "train" and args.preset in ("core", "care", "paper"):
+    if job["type"] == "train" and args.preset in ("core", "care", "q1_paper", "paper"):
         final_predictions = Path(job["output"]) / f"eval_{job['steps']:07d}" / "detections.json"
         if not final_predictions.is_file():
             raise RuntimeError(f"Missing final COCO detections: {final_predictions}")
@@ -843,6 +934,11 @@ def _mirror_workspace_state(args, registry: ExperimentRegistry) -> None:
             "device": args.device,
             "amp": args.amp,
             "batch_size": args.batch_size,
+            "grad_accum_steps": args.grad_accum_steps,
+            "detector": args.detector,
+            "lr": args.lr,
+            "lr_schedule": args.lr_schedule,
+            "lr_warmup_steps": args.lr_warmup_steps,
             "warmup_steps": args.warmup_steps,
             "train_steps": args.train_steps,
             "max_side": args.max_side,
@@ -1111,7 +1207,7 @@ def _run_reports_and_plots(args, registry: ExperimentRegistry, dag: PipelineDAG,
             runtime_delta_sec=time.monotonic() - t0,
         )
 
-    if args.preset in ("core", "care", "paper"):
+    if args.preset in ("core", "care", "q1_paper", "paper"):
         t1 = time.monotonic()
         from plot_results import render
         fig_dir = render(args.output)
@@ -1246,6 +1342,11 @@ def main(argv=None):
                 "device": args.device,
                 "amp": args.amp,
                 "batch_size": args.batch_size,
+                "grad_accum_steps": args.grad_accum_steps,
+                "detector": args.detector,
+                "lr": args.lr,
+                "lr_schedule": args.lr_schedule,
+                "lr_warmup_steps": args.lr_warmup_steps,
                 "warmup_steps": args.warmup_steps,
                 "train_steps": args.train_steps,
                 "max_side": args.max_side,

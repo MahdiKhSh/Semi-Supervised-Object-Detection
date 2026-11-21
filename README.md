@@ -25,19 +25,22 @@ class/condition AP diagnostics, and cumulative CSV/JSON/Markdown reports.
 Re-running the same launcher (or double-clicking **RUN_RESUME.cmd**)
 resumes automatically without redoing completed work.
 
-### Recovery, status, and cross-GPU (Kaggle / Colab / L40s / RTX 5090)
+### Recovery, status, Q1 paper suite, and cross-GPU (Kaggle / Colab / L40s / RTX 5090)
 
+- **RUN_Q1_PAPER.cmd**: Recommended Q1 publication matrix (`--preset q1_paper`, `FasterRCNN-FPN-v2`, `800px`, effective batch 8, `warmup_cosine` LR): compares `supervised`, `mean_teacher`, faithful `soft_teacher` (ICCV'21), `consistent_teacher` GMM (CVPR'23), and proposed **`core_ssod`** (Weighted Conformal Risk Control under zero-metadata photometric shift + scale-aware NWD/JS + Tri-Zone ambiguity-suppressed KL/GIoU). See [Q1 paper protocol](docs/Q1_PAPER_PROTOCOL.md).
 - **RUN_RESUME.cmd**: Resume the previously selected suite from its last valid checkpoint.
 - **RUN_STATUS.cmd**: Inspect progress, steps, runtime, ETA, and resume command without launching training.
 - **RUN_BENCHMARK.cmd**: Run a resumable GPU/CPU throughput benchmark only.
 - **CLI shortcuts**:
   ```powershell
+  python scripts/run_suite.py --preset q1_pilot --resume
+  python scripts/run_suite.py --preset q1_paper --resume
   python scripts/run_suite.py --preset core --resume
   python scripts/run_suite.py --preset paper --resume
-  python scripts/run_suite.py --preset core --status
-  python scripts/run_suite.py --preset core --dry-run
+  python scripts/run_suite.py --preset q1_paper --status
+  python scripts/run_suite.py --preset q1_paper --dry-run
   ```
-- **Cloud / Multi-GPU transfer (Kaggle -> L40s -> RTX 5090)**: Use `notebooks/run_ssod_cloud.ipynb` or `scripts/run_cloud.sh`, transfer checkpoints safely via `scripts/sync_workspace.py export` / `import`, and pass `--sync-github` to push lightweight results and `docs/PROJECT_PROGRESS.md` to GitHub without committing weights or datasets.
+- **Cloud / Multi-GPU transfer (Kaggle -> L40s -> RTX 5090)**: Use `notebooks/run_ssod_cloud.ipynb` or `scripts/run_cloud.sh` (Kaggle `2×4` and 5090/L40s `4×2` share the exact same `effective_batch_size=8` fingerprint!), transfer checkpoints safely via `scripts/sync_workspace.py export` / `import`, and pass `--sync-github` to push lightweight results and `docs/PROJECT_PROGRESS.md` to GitHub without committing weights or datasets.
 
 Nothing changes RDP, firewall, VPN or system GPU driver.
 
@@ -46,10 +49,14 @@ Nothing changes RDP, firewall, VPN or system GPU driver.
 | Component | File |
 |---|---|
 | Primary native PyTorch/TorchVision trainer | ssod_research/native_training.py |
+| Proposed CoRe-SSOD (Weighted Conformal Risk Control) | ssod_research/conformal.py |
+| Proposed CaRe-SSOD (Visibility + NWD/JS + Tri-Zone KL/GIoU) | ssod_research/care_ssod.py |
+| Strong published baselines (Soft Teacher + Consistent-Teacher GMM) | ssod_research/baselines.py |
 | Atomic checkpoints, SHA-256 sidecars, file locks, RNG | ssod_research/recovery.py |
 | Transactional SQLite experiment registry | ssod_research/registry.py |
 | 15-stage dependency DAG & progress/ETA reporting | ssod_research/pipeline.py |
 | Cross-GPU bundle transfer, cloud lease & GitHub sync | ssod_research/cloud_sync.py |
+| Zero-shot external adverse-weather evaluator (DAWN/ACDC) | scripts/eval_external.py |
 | Resize, image/box transform, COCO data loading | ssod_research/native_data.py |
 | Geometric mappings and class-matched IoU | ssod_research/geometry.py |
 | Differentiable box/class/confidence stability loss | ssod_research/consistency.py |

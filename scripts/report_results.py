@@ -60,6 +60,11 @@ def stats_for_rows(rows):
         ("care_ssod", "supervised"),
         ("care_ssod", "mean_teacher"),
         ("care_ssod", "full"),
+        ("core_ssod", "supervised"),
+        ("core_ssod", "mean_teacher"),
+        ("core_ssod", "soft_teacher"),
+        ("core_ssod", "consistent_teacher"),
+        ("core_ssod", "care_ssod"),
     )
     for fraction in sorted({p for p, _ in groups}):
         for candidate, baseline in comparison_pairs:

@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
 # Portable resumable SSOD runner for Kaggle (T4/P100), Google Colab, and Linux GPUs (L40s / 5090 / A100).
 # Usage:
-#   PRESET=core SYNC_GITHUB=1 bash scripts/run_cloud.sh
-#   PRESET=core SYNC_DIR=/content/drive/MyDrive/ssod_state SYNC_GITHUB=1 bash scripts/run_cloud.sh
+#   PRESET=q1_pilot BATCH_SIZE=2 GRAD_ACCUM_STEPS=4 SYNC_GITHUB=1 bash scripts/run_cloud.sh
+#   PRESET=q1_paper BATCH_SIZE=4 GRAD_ACCUM_STEPS=2 SYNC_GITHUB=1 bash scripts/run_cloud.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-PRESET="${PRESET:-core}"
+PRESET="${PRESET:-q1_paper}"
 OUTPUT_DIR="${OUTPUT_DIR:-$ROOT/work_dirs/${PRESET}_runs}"
 SYNC_DIR="${SYNC_DIR:-}"
 SYNC_GITHUB="${SYNC_GITHUB:-0}"
 BENCHMARK="${BENCHMARK:-1}"
 DEVICE="${DEVICE:-auto}"
 AMP="${AMP:-auto}"
+BATCH_SIZE="${BATCH_SIZE:-}"
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
@@ -44,6 +46,8 @@ ARGS=(
   "--output" "$OUTPUT_DIR"
 )
 
+if [[ -n "$BATCH_SIZE" ]]; then ARGS+=("--batch-size" "$BATCH_SIZE"); fi
+if [[ -n "$GRAD_ACCUM_STEPS" ]]; then ARGS+=("--grad-accum-steps" "$GRAD_ACCUM_STEPS"); fi
 if [[ -n "${TRAIN_LABELS:-}" ]]; then ARGS+=("--train-labels" "$TRAIN_LABELS"); fi
 if [[ -n "${VAL_LABELS:-}" ]]; then ARGS+=("--val-labels" "$VAL_LABELS"); fi
 if [[ -n "${TRAIN_IMAGES:-}" ]]; then ARGS+=("--train-images" "$TRAIN_IMAGES"); fi

@@ -60,3 +60,15 @@ and cross-GPU portable execution architecture.
   3. Online dual-axis (class x visibility) EMA threshold calibrator (saved in checkpoints for exact deterministic resume).
   4. Tri-Zone reliability partitioning with single-pass FPN feature-shared Ambiguity-Zone background proposal suppression + aligned reliability-weighted GIoU and temperature-scaled KL soft distillation (eliminates hard-negative background poisoning, conflicting CE-vs-MSE losses, and redundant double student backbone forward passes).
 - **Scientific Claim Discipline**: All baselines (`supervised`, `mean_teacher`, `full`) remain untouched for matched comparison; publication claims require measured multi-seed BDD100K gains from `--preset care`.
+
+## 10. Q1 Journal Upgrade: CoRe-SSOD & Strong Baselines (`conformal.py`, `baselines.py`)
+
+- **Weighted Conformal Risk Control (`core_ssod`, `--preset q1_paper` / `--preset q1_pilot`)**:
+  - Replaces heuristic thresholds with finite-sample Conformal Risk Control on a strictly disjoint calibration fold (`8%`, max 256 images) carved from the labeled training split (zero validation leakage).
+  - Monotonized upper-envelope FDR loss $\tilde{L}(x_i; \lambda) \in [0, 1]$ weighted by unlabeled-to-calibration photometric degradation density ratios $w_r(d(x_i))$ derives Zone-1 ($\alpha_{\text{strict}} = 0.15$) and Zone-2 ($\alpha_{\text{loose}} = 0.40$) thresholds automatically with per-class empirical-Bayes shrinkage.
+- **Strong Controlled Baselines (`ssod_research/baselines.py`)**:
+  - `soft_teacher` (ICCV 2021): faithful Box Jittering localization filtering + Soft-Negative Background Classification Weighting via EMA Teacher background probabilities.
+  - `consistent_teacher` (CVPR 2023): checkpoint-serializable per-class 1D 2-component GMM dynamic thresholding.
+- **Training Recipe & Cross-GPU Effective Batch Invariance**:
+  - Added `fasterrcnn_v2` (`fasterrcnn_resnet50_fpn_v2`), `max_side = 800`, `warmup_cosine` / `warmup_multistep` LR schedules, and `--grad-accum-steps`.
+  - Fingerprint uses `effective_batch_size = batch_size * grad_accum_steps` so Kaggle T4 (`2×4`) and RTX 5090 / L40s (`4×2` or `8×1`) resume seamlessly with identical per-step image ordering.

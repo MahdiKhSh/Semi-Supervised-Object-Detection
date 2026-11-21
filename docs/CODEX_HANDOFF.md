@@ -63,9 +63,14 @@ At the start of every new Codex / agent session, execute these steps BEFORE modi
 
 ## Current Status Summary
 
-- **Completed**: Full crash-safe, resumable, idempotent, dependency-aware execution architecture (`recovery.py`, `registry.py`, `pipeline.py`, `cloud_sync.py`, upgraded `native_training.py`, `prepare_bdd100k.py`, `run_suite.py`, `benchmark_gpu.py`, `sync_workspace.py`, Windows `.cmd` launchers, Linux/Cloud runner, Colab/Kaggle notebook, and automated recovery test suite).
-- **Next Unfinished Task**: Run `RUN_BENCHMARK.cmd` (or Kaggle/L40s cloud run) and launch `--preset core --resume` on real BDD100K data.
-- **Blocked**: None (ensure real BDD100K dataset paths are supplied before `pilot`/`core`/`paper` runs).
+- **Completed**:
+  - Full crash-safe, resumable, idempotent, dependency-aware 15-stage execution architecture (`recovery.py`, `registry.py`, `pipeline.py`, `cloud_sync.py`, `run_suite.py`, `benchmark_gpu.py`, `sync_workspace.py`, Windows `.cmd` launchers, Linux/Cloud runner, Colab/Kaggle notebook).
+  - Fixed critical TorchVision class-10 (`traffic sign`) crash in `consistency.py`.
+  - Implemented Q1-ready proposed method **`CoRe-SSOD`** (`conformal.py` + `care_ssod.py`: Weighted Conformal Risk Control under zero-metadata photometric visibility shift + scale-aware NWD/JS + Tri-Zone ambiguity background suppression + single-pass FPN KL/GIoU).
+  - Implemented strong matched baselines (`baselines.py`: faithful **Soft Teacher ICCV'21** with Box Jitter + Soft-Negative BG Weighting, and **Consistent-Teacher CVPR'23** dynamic per-class 1D GMM).
+  - Upgraded training recipe (`fasterrcnn_v2`, `max_side=800`, `warmup_cosine` LR, cross-GPU portable `--grad-accum-steps` with constant `effective_batch_size=8`, `--preset q1_pilot` & `--preset q1_paper`, `RUN_Q1_PAPER.cmd`, `scripts/eval_external.py`, conformal/condition figures in `plot_results.py`, and `docs/Q1_PAPER_PROTOCOL.md`).
+- **Next Unfinished Task**: Obtain official BDD100K (or attach Kaggle BDD100K dataset), run `--preset q1_pilot` (~15 min on 5090 / ~45 min on Kaggle T4) to verify AP climb and empirical conformal FDR calibration curves, then launch `--preset q1_paper --resume --sync-github`.
+- **Blocked**: Waiting on BDD100K dataset download/attachment (see `docs/Q1_PAPER_PROTOCOL.md`).
 
 ## Non-Negotiable Restrictions
 

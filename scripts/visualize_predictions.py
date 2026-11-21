@@ -24,9 +24,10 @@ def visualize(checkpoint, images, output, *, max_images=20, max_side=640,
         raise ValueError(f"No images found in {source}")
     dest = torch.device("cuda" if device == "auto" and torch.cuda.is_available()
                         else "cpu" if device == "auto" else device)
-    model = build_model(pretrained_backbone=False, max_side=max_side).to(dest)
     # Safe weights-only load (no arbitrary pickled code execution).
     state = safe_torch_load(checkpoint)
+    detector_type = (state.get("config") or {}).get("detector", "fasterrcnn_v1")
+    model = build_model(pretrained_backbone=False, max_side=max_side, detector=detector_type).to(dest)
     weights = state.get("teacher") or state.get("student")
     if weights is None:
         raise ValueError("checkpoint has neither teacher nor student weights")

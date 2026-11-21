@@ -34,14 +34,23 @@ import numpy as np
 import torch
 import torchvision
 from torchvision.models import ResNet50_Weights
-from torchvision.models.detection import fasterrcnn_resnet50_fpn
+from torchvision.models.detection import fasterrcnn_resnet50_fpn, fasterrcnn_resnet50_fpn_v2
 from torchvision.ops import box_iou
 
+from ssod_research.baselines import (
+    DynamicGMMThreshold,
+    soft_teacher_extract,
+    soft_teacher_unsupervised_loss,
+)
 from ssod_research.care_ssod import (
     OnlineVisibilityClassCalibrator,
     care_unsupervised_loss,
     extract_teacher_tri_zone_targets,
     strong_view_care,
+)
+from ssod_research.conformal import (
+    WeightedConformalRiskCalibrator,
+    split_calibration_indices,
 )
 from ssod_research.consistency import weighted_consistency_loss
 from ssod_research.native_data import RoadCocoDataset, image_inventory_check, strong_view
@@ -72,13 +81,24 @@ BDD_CLASSES = (
     "background", "pedestrian", "rider", "car", "truck", "bus",
     "train", "motorcycle", "bicycle", "traffic light", "traffic sign",
 )
-VARIANTS = ("supervised", "mean_teacher", "reliability", "adaptive", "condition", "full", "care_ssod")
+VARIANTS = (
+    "supervised",
+    "mean_teacher",
+    "soft_teacher",
+    "consistent_teacher",
+    "reliability",
+    "adaptive",
+    "condition",
+    "full",
+    "care_ssod",
+    "core_ssod",
+)
 
 _NON_IDENTITY_KEYS = frozenset({
     "output", "data_root", "train_images", "val_images", "init_checkpoint",
     "resume", "steps", "eval_every", "save_every", "eval_max_images",
     "device", "amp", "registry_db", "experiment_id", "keep_checkpoints",
-    "stop_after_steps", "deterministic",
+    "stop_after_steps", "deterministic", "batch_size", "grad_accum_steps",
 })
 
 
@@ -122,30 +142,49 @@ def resolve_amp(amp: str, device: torch.device) -> tuple[str, bool, torch.dtype 
     return "fp16", True, torch.float16
 
 
-def build_model(*, pretrained_backbone, max_side, min_size=None):
+def build_model(*, pretrained_backbone, max_side, min_size=None, detector="fasterrcnn_v1"):
     """Same backbone and detector hyperparameters across all variants."""
-    backbone_weights = ResNet50_Weights.IMAGENET1K_V1 if pretrained_backbone else None
     size = int(min_size or max_side)
-    detector = fasterrcnn_resnet50_fpn(
-        weights=None, weights_backbone=backbone_weights,
-        num_classes=len(BDD_CLASSES), min_size=size, max_size=int(max_side),
-        box_detections_per_img=100, trainable_backbone_layers=3)
+    if detector == "fasterrcnn_v2":
+        backbone_weights = ResNet50_Weights.IMAGENET1K_V2 if pretrained_backbone else None
+        model = fasterrcnn_resnet50_fpn_v2(
+            weights=None, weights_backbone=backbone_weights,
+            num_classes=len(BDD_CLASSES), min_size=size, max_size=int(max_side),
+            box_detections_per_img=100, trainable_backbone_layers=3)
+    else:
+        backbone_weights = ResNet50_Weights.IMAGENET1K_V1 if pretrained_backbone else None
+        model = fasterrcnn_resnet50_fpn(
+            weights=None, weights_backbone=backbone_weights,
+            num_classes=len(BDD_CLASSES), min_size=size, max_size=int(max_side),
+            box_detections_per_img=100, trainable_backbone_layers=3)
     # TorchVision ignores trainable_backbone_layers without pretrained weights.
     # Fix the unfrozen-stage set after a no-download supervised warm start so
     # all variants actually train the SAME backbone layers.
-    for name, parameter in detector.backbone.body.named_parameters():
+    for name, parameter in model.backbone.body.named_parameters():
         if not name.startswith(("layer2.", "layer3.", "layer4.")):
             parameter.requires_grad_(False)
-    return detector
+    return model
 
 
-def build_scheduler(optimizer, *, schedule: str, total_steps: int):
-    if schedule == "cosine":
-        return torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=max(1, int(total_steps)), eta_min=0.0)
-    if schedule == "multistep":
-        m1 = max(1, int(round(0.65 * total_steps)))
-        m2 = max(m1 + 1, int(round(0.85 * total_steps)))
+def build_scheduler(optimizer, *, schedule: str, total_steps: int, warmup_steps: int = 0):
+    total = max(1, int(total_steps))
+    wu = max(0, min(int(warmup_steps), total - 1)) if total > 1 else 0
+    if schedule == "warmup_cosine" and wu > 0:
+        w = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=wu)
+        c = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, total - wu), eta_min=0.0)
+        return torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[w, c], milestones=[wu])
+    if schedule == "warmup_multistep" and wu > 0:
+        w = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=wu)
+        rem = max(1, total - wu)
+        m1 = max(1, int(round(0.65 * rem)))
+        m2 = max(m1 + 1, int(round(0.85 * rem)))
+        ms = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[m1, m2], gamma=0.1)
+        return torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[w, ms], milestones=[wu])
+    if schedule in ("cosine", "warmup_cosine"):
+        return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total, eta_min=0.0)
+    if schedule in ("multistep", "warmup_multistep"):
+        m1 = max(1, int(round(0.65 * total)))
+        m2 = max(m1 + 1, int(round(0.85 * total)))
         return torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[m1, m2], gamma=0.1)
     return torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0, total_iters=0)
 
@@ -469,9 +508,14 @@ def evaluate(
 
 
 def build_scientific_identity(args, *, init_checkpoint_sha256: str | None = None) -> dict:
-    """Path-independent scientific identity so checkpoints transfer across GPUs/hosts."""
+    """Path-independent scientific identity so checkpoints transfer across GPUs/hosts.
+
+    Uses ``effective_batch_size = batch_size * grad_accum_steps`` so a run started
+    on Kaggle T4 (2x4) can resume identically on RTX 5090 / L40s (4x2 or 8x1).
+    """
     config = vars(args).copy()
     identity = {k: v for k, v in config.items() if k not in _NON_IDENTITY_KEYS}
+    identity["effective_batch_size"] = int(getattr(args, "batch_size", 1)) * int(getattr(args, "grad_accum_steps", 1))
     if init_checkpoint_sha256:
         identity["init_checkpoint_sha256"] = init_checkpoint_sha256
     return identity
@@ -542,12 +586,19 @@ def parse_args(argv=None):
     p.add_argument("--init-checkpoint", default=None,
                    help="Warm-start model weights from a completed supervised warmup")
     p.add_argument("--variant", choices=VARIANTS, required=True)
+    p.add_argument("--detector", choices=("fasterrcnn_v1", "fasterrcnn_v2"), default="fasterrcnn_v1")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--steps", type=int, default=100)
     p.add_argument("--batch-size", type=int, default=1)
+    p.add_argument("--grad-accum-steps", type=int, default=1)
     p.add_argument("--max-side", type=int, default=640)
     p.add_argument("--lr", type=float, default=0.003)
-    p.add_argument("--lr-schedule", default="constant", choices=("constant", "multistep", "cosine"))
+    p.add_argument(
+        "--lr-schedule",
+        default="constant",
+        choices=("constant", "multistep", "cosine", "warmup_cosine", "warmup_multistep"),
+    )
+    p.add_argument("--lr-warmup-steps", type=int, default=0)
     p.add_argument("--ema", type=float, default=0.999)
     p.add_argument("--pseudo-threshold", type=float, default=0.7)
     p.add_argument("--min-quality", type=float, default=0.3)
@@ -569,6 +620,12 @@ def parse_args(argv=None):
     p.add_argument("--care-kl-z1-weight", type=float, default=0.5)
     p.add_argument("--care-kl-z2-weight", type=float, default=0.35)
     p.add_argument("--care-temperature", type=float, default=2.0)
+    p.add_argument("--conformal-alpha-strict", type=float, default=0.15)
+    p.add_argument("--conformal-alpha-loose", type=float, default=0.40)
+    p.add_argument("--conformal-every", type=int, default=250)
+    p.add_argument("--conformal-cal-fraction", type=float, default=0.08)
+    p.add_argument("--conformal-max-cal", type=int, default=256)
+    p.add_argument("--conformal-vis-weight", type=int, choices=(0, 1), default=1)
     p.add_argument("--eval-every", type=int, default=200)
     p.add_argument("--save-every", type=int, default=100)
     p.add_argument("--keep-checkpoints", type=int, default=2)
@@ -584,11 +641,12 @@ def parse_args(argv=None):
     p.add_argument("--stop-after-steps", type=int, default=0,
                    help="Testing/budget helper: gracefully checkpoint and stop after N steps in this invocation.")
     args = p.parse_args(argv)
-    if args.steps < 1 or args.batch_size < 1 or args.max_side < 64:
-        p.error("steps, batch size and max_side out of range")
-    if args.save_every < 1 or args.eval_every < 1:
-        p.error("save_every and eval_every must be >= 1")
-    for name in ("pseudo_threshold", "min_quality", "agreement_iou", "ema"):
+    if args.steps < 1 or args.batch_size < 1 or args.grad_accum_steps < 1 or args.max_side < 64:
+        p.error("steps, batch size, grad_accum_steps and max_side out of range")
+    if args.save_every < 1 or args.eval_every < 1 or args.conformal_every < 1:
+        p.error("save_every, eval_every and conformal_every must be >= 1")
+    for name in ("pseudo_threshold", "min_quality", "agreement_iou", "ema",
+                 "conformal_alpha_strict", "conformal_alpha_loose", "conformal_cal_fraction"):
         value = getattr(args, name)
         if not 0 <= value <= 1:
             p.error(f"{name} must be in [0,1]")
@@ -696,6 +754,7 @@ def _train_locked(args, out: Path):
     model = build_model(
         pretrained_backbone=args.pretrained_backbone and not bool(args.init_checkpoint),
         max_side=args.max_side,
+        detector=getattr(args, "detector", "fasterrcnn_v1"),
     ).to(device)
     teacher = copy.deepcopy(model).to(device) if unlabeled is not None else None
     if teacher is not None:
@@ -703,8 +762,25 @@ def _train_locked(args, out: Path):
         for p in teacher.parameters():
             p.requires_grad_(False)
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=1e-4)
-    scheduler = build_scheduler(optimizer, schedule=args.lr_schedule, total_steps=args.steps)
+    scheduler = build_scheduler(
+        optimizer,
+        schedule=args.lr_schedule,
+        total_steps=args.steps,
+        warmup_steps=int(getattr(args, "lr_warmup_steps", 0)),
+    )
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and amp_mode == "fp16"))
+
+    # Strictly disjoint calibration split carved ONLY from labeled training data (never val.json)
+    if args.variant == "core_ssod":
+        train_labeled_ids, cal_labeled_ids = split_calibration_indices(
+            len(labeled),
+            seed=args.seed,
+            cal_fraction=float(args.conformal_cal_fraction),
+            max_cal=int(args.conformal_max_cal),
+        )
+    else:
+        train_labeled_ids = list(range(len(labeled)))
+        cal_labeled_ids = []
 
     running_stats = {"total_candidates": 0, "total_accepted": 0, "total_quality_sum": 0.0}
     care_calibrator = (
@@ -713,6 +789,24 @@ def _train_locked(args, out: Path):
             base_threshold=args.pseudo_threshold,
         )
         if args.variant == "care_ssod"
+        else None
+    )
+    conformal_calibrator = (
+        WeightedConformalRiskCalibrator(
+            num_foreground_classes=len(BDD_CLASSES) - 1,
+            alpha_strict=float(args.conformal_alpha_strict),
+            alpha_loose=float(args.conformal_alpha_loose),
+            use_visibility_weighting=bool(args.conformal_vis_weight),
+        )
+        if args.variant == "core_ssod"
+        else None
+    )
+    gmm_threshold = (
+        DynamicGMMThreshold(
+            num_foreground_classes=len(BDD_CLASSES) - 1,
+            base_threshold=float(args.pseudo_threshold),
+        )
+        if args.variant == "consistent_teacher"
         else None
     )
     start = 0
@@ -767,6 +861,16 @@ def _train_locked(args, out: Path):
                         care_calibrator.load_state_dict(alg["care_calibrator"])
                     else:
                         resume_warnings.append("care_ssod online calibrator state missing")
+                if conformal_calibrator is not None:
+                    if isinstance(alg.get("conformal_calibrator"), dict):
+                        conformal_calibrator.load_state_dict(alg["conformal_calibrator"])
+                    else:
+                        resume_warnings.append("core_ssod conformal calibrator state missing")
+                if gmm_threshold is not None:
+                    if isinstance(alg.get("gmm_threshold"), dict):
+                        gmm_threshold.load_state_dict(alg["gmm_threshold"])
+                    else:
+                        resume_warnings.append("consistent_teacher GMM threshold state missing")
             else:
                 resume_warnings.append("algorithm mutable state missing")
 
@@ -819,12 +923,15 @@ def _train_locked(args, out: Path):
 
     step_log = out / "steps.jsonl"
     eval_log = out / "evaluations.jsonl"
+    conformal_log = out / "conformal_calibration.jsonl"
     if start > 0:
         truncate_jsonl(step_log, start)
         truncate_jsonl(eval_log, start)
+        truncate_jsonl(conformal_log, start)
     elif resume_mode == "fresh_after_missing_checkpoint":
         truncate_jsonl(step_log, 0)
         truncate_jsonl(eval_log, 0)
+        truncate_jsonl(conformal_log, 0)
 
     metadata = {
         "created_utc": previous_metadata.get("created_utc") or utc_now(),
@@ -927,6 +1034,8 @@ def _train_locked(args, out: Path):
                 "class_counts": counts,
                 "running_stats": dict(running_stats),
                 "care_calibrator": care_calibrator.state_dict() if care_calibrator is not None else None,
+                "conformal_calibrator": conformal_calibrator.state_dict() if conformal_calibrator is not None else None,
+                "gmm_threshold": gmm_threshold.state_dict() if gmm_threshold is not None else None,
             },
             "metrics_state": {
                 "elapsed_seconds": elapsed_total,
@@ -994,117 +1103,254 @@ def _train_locked(args, out: Path):
         print("EVAL", json.dumps(metrics_row), flush=True)
         return metrics_row
 
+    def _run_conformal_calibration(step_num: int):
+        if conformal_calibrator is None or teacher is None or not cal_labeled_ids:
+            return None
+        saved_rng = capture_rng_state()
+        try:
+            diag = conformal_calibrator.calibrate_on_dataset(
+                teacher,
+                labeled,
+                cal_labeled_ids,
+                device,
+                step=step_num,
+                max_samples=int(args.conformal_max_cal),
+                use_nwd=bool(args.care_nwd),
+            )
+        finally:
+            restore_rng_state(saved_rng, device.type)
+        append_jsonl(conformal_log, diag)
+        print("CONFORMAL", json.dumps(diag), flush=True)
+        return diag
+
+    grad_accum = max(1, int(getattr(args, "grad_accum_steps", 1)))
+    eff_batch = int(args.batch_size) * grad_accum
+
+    if conformal_calibrator is not None and conformal_calibrator.calibration_count == 0 and start < args.steps:
+        _run_conformal_calibration(start)
+
     steps_this_call = 0
     try:
         for step in range(start, args.steps):
             model.train()
-            selection = sample_indices(len(labeled), args.batch_size, args.seed, step, 0)
-            train_batch = cpu_batch(labeled, selection)
-            images = [img.to(device) for img, _ in train_batch]
-            targets = portable_targets(train_batch, device)
             optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
-                sup_losses = model(images, targets)
-                supervised = sum(sup_losses.values())
-                total = supervised
-            extra = {"sup": float(supervised.detach()), "unsup": 0.0, "stability": 0.0,
-                     "candidates": 0, "accepted": 0}
-            if teacher is not None and args.variant == "care_ssod":
-                ids = sample_indices(len(unlabeled), args.batch_size, args.seed, step, 1)
-                batch_u = cpu_batch(unlabeled, ids)
-                originals = [img.to(device) for img, _ in batch_u]
-                tri_outputs, statistics = extract_teacher_tri_zone_targets(
-                    teacher,
-                    originals,
-                    care_calibrator,
-                    use_nwd=bool(args.care_nwd),
-                    use_visibility_calibration=bool(args.care_visibility_cal),
-                    use_tri_zone=bool(args.care_tri_zone),
-                )
-                extra.update(statistics)
-                running_stats["total_candidates"] += int(statistics.get("candidates", 0))
-                running_stats["total_accepted"] += int(statistics.get("accepted", 0))
-                running_stats["total_quality_sum"] += float(statistics.get("quality_sum", 0.0))
+            sup_all_slots = sample_indices(len(train_labeled_ids), eff_batch, args.seed, step, 0)
+            u_all_ids = (
+                sample_indices(len(unlabeled), eff_batch, args.seed, step, 1)
+                if teacher is not None else []
+            )
 
-                rng = random.Random(args.seed * 7103 + step * 61 + 3)
-                aug_images, z1_targets, z1_meta, z2_meta = [], [], [], []
-                for img, (_, target), item in zip(originals, batch_u, tri_outputs):
-                    a_img, a_z1, a_z2 = strong_view_care(
-                        img, item["zone1"], item["zone2"],
-                        rng=rng, enable_cutout=bool(args.care_cutout),
-                    )
-                    aug_images.append(a_img)
-                    z1_targets.append(target_for_training(a_z1, image_id=int(target["image_id"])))
-                    z1_meta.append(a_z1)
-                    z2_meta.append(a_z2)
+            step_loss_sum = 0.0
+            sup_sum = 0.0
+            unsup_sum = 0.0
+            stab_sum = 0.0
+            extra: dict = {
+                "sup": 0.0, "unsup": 0.0, "stability": 0.0,
+                "candidates": 0, "accepted": 0,
+            }
+
+            for micro in range(grad_accum):
+                sl = slice(micro * args.batch_size, (micro + 1) * args.batch_size)
+                selection = [train_labeled_ids[idx] for idx in sup_all_slots[sl]]
+                train_batch = cpu_batch(labeled, selection)
+                images = [img.to(device) for img, _ in train_batch]
+                targets = portable_targets(train_batch, device)
 
                 with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
-                    care_loss, care_extra = care_unsupervised_loss(
-                        model,
-                        aug_images,
-                        z1_targets,
-                        z1_meta,
-                        z2_meta,
-                        use_tri_zone=bool(args.care_tri_zone),
-                        giou_weight=float(args.care_giou_weight),
-                        kl_zone1_weight=float(args.care_kl_z1_weight),
-                        kl_zone2_weight=float(args.care_kl_z2_weight),
-                        temperature=float(args.care_temperature),
-                    )
-                    if care_loss is not None:
-                        total = total + args.unsup_weight * care_loss
-                    extra.update(care_extra)
-            elif teacher is not None:
-                ids = sample_indices(len(unlabeled), args.batch_size, args.seed, step, 1)
-                batch_u = cpu_batch(unlabeled, ids)
-                originals = [img.to(device) for img, _ in batch_u]
-                attributes = [attrs.get(unlabeled.images[idx]["file_name"], {}) for idx in ids]
-                pseudo, statistics = pseudo_targets(
-                    teacher, originals, variant=args.variant, threshold=args.pseudo_threshold,
-                    min_quality=args.min_quality, localization_scale=args.localization_scale,
-                    agreement_iou=args.agreement_iou, counts=counts,
-                    localization_enabled=bool(args.localization_enabled),
-                    adaptive_strength=args.adaptive_strength, attrs_list=attributes,
-                    condition_offset=args.condition_offset)
-                extra.update(statistics)
-                running_stats["total_candidates"] += int(statistics.get("candidates", 0))
-                running_stats["total_accepted"] += int(statistics.get("accepted", 0))
-                running_stats["total_quality_sum"] += float(statistics.get("quality_sum", 0.0))
+                    sup_losses = model(images, targets)
+                    supervised = sum(sup_losses.values())
+                    micro_total = supervised
+                sup_sum += float(supervised.detach()) / grad_accum
 
-                rng = random.Random(args.seed * 7103 + step * 61 + 3)
-                augmented = []
-                for img, (_, target), p in zip(originals, batch_u, pseudo):
-                    flip = rng.random() < 0.5
-                    brightness = rng.uniform(0.75, 1.25)
-                    contrast = rng.uniform(0.75, 1.25)
-                    pseudo_target = target_for_training(p, image_id=int(target["image_id"]))
-                    img, trans = strong_view(img, pseudo_target, flip=flip,
-                                             brightness=brightness, contrast=contrast)
-                    trans["scores"] = p["scores"]
-                    trans["uncertainty"] = p["uncertainty"]
-                    augmented.append((img, trans))
-                if any(len(t["boxes"]) > 0 for _, t in augmented):
-                    aug_images = [item[0] for item in augmented]
-                    aug_targets = [target_for_training(item[1], image_id=int(item[1]["image_id"]))
-                                   for item in augmented]
-                    with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
-                        unsup_losses = model(aug_images, aug_targets)
-                        unsupervised = sum(unsup_losses.values())
-                        total = total + args.unsup_weight * unsupervised
-                        extra["unsup"] = float(unsupervised.detach())
-                        if args.variant == "full" and args.consistency_weight:
-                            stability = consistency_roi_loss(
-                                model, aug_images, [t for _, t in augmented],
-                                box_weight=args.box_weight, class_weight=args.class_weight,
-                                confidence_weight=args.confidence_weight,
-                                reliability_scale=args.localization_scale)
-                            if stability:
-                                stab_total = sum(stability.values())
-                                total = total + args.consistency_weight * stab_total
-                                extra["stability"] = float(stab_total.detach())
-            if not torch.isfinite(total):
-                raise RuntimeError(f"non-finite loss at step {step + 1}")
-            scaler.scale(total).backward()
+                if teacher is not None:
+                    ids = u_all_ids[sl]
+                    batch_u = cpu_batch(unlabeled, ids)
+                    originals = [img.to(device) for img, _ in batch_u]
+                    rng = random.Random(args.seed * 7103 + step * 61 + micro * 17 + 3)
+
+                    if args.variant in ("care_ssod", "core_ssod"):
+                        active_cal = conformal_calibrator if args.variant == "core_ssod" else care_calibrator
+                        tri_outputs, statistics = extract_teacher_tri_zone_targets(
+                            teacher,
+                            originals,
+                            active_cal,
+                            use_nwd=bool(args.care_nwd),
+                            use_visibility_calibration=(
+                                bool(args.conformal_vis_weight)
+                                if args.variant == "core_ssod"
+                                else bool(args.care_visibility_cal)
+                            ),
+                            use_tri_zone=bool(args.care_tri_zone),
+                        )
+                        extra["candidates"] += int(statistics.get("candidates", 0))
+                        extra["accepted"] += int(statistics.get("accepted", 0))
+                        extra["zone1_count"] = int(extra.get("zone1_count", 0)) + int(statistics.get("zone1_count", 0))
+                        extra["zone2_count"] = int(extra.get("zone2_count", 0)) + int(statistics.get("zone2_count", 0))
+                        extra["degradation_mean"] = statistics.get("degradation_mean", 0.0)
+                        running_stats["total_candidates"] += int(statistics.get("candidates", 0))
+                        running_stats["total_accepted"] += int(statistics.get("accepted", 0))
+                        running_stats["total_quality_sum"] += float(statistics.get("quality_sum", 0.0))
+
+                        aug_images, z1_targets, z1_meta, z2_meta = [], [], [], []
+                        for img, (_, target), item in zip(originals, batch_u, tri_outputs):
+                            a_img, a_z1, a_z2 = strong_view_care(
+                                img, item["zone1"], item["zone2"],
+                                rng=rng, enable_cutout=bool(args.care_cutout),
+                            )
+                            aug_images.append(a_img)
+                            z1_targets.append(target_for_training(a_z1, image_id=int(target["image_id"])))
+                            z1_meta.append(a_z1)
+                            z2_meta.append(a_z2)
+
+                        with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
+                            care_loss, care_extra = care_unsupervised_loss(
+                                model,
+                                aug_images,
+                                z1_targets,
+                                z1_meta,
+                                z2_meta,
+                                use_tri_zone=bool(args.care_tri_zone),
+                                giou_weight=float(args.care_giou_weight),
+                                kl_zone1_weight=float(args.care_kl_z1_weight),
+                                kl_zone2_weight=float(args.care_kl_z2_weight),
+                                temperature=float(args.care_temperature),
+                            )
+                            if care_loss is not None:
+                                micro_total = micro_total + args.unsup_weight * care_loss
+                            unsup_sum += float(care_extra.get("unsup", 0.0)) / grad_accum
+                            stab_sum += float(care_extra.get("stability", 0.0)) / grad_accum
+                            extra["suppressed_bg"] = int(extra.get("suppressed_bg", 0)) + int(care_extra.get("suppressed_bg", 0))
+
+                    elif args.variant == "soft_teacher":
+                        st_pseudo, statistics, t_cache = soft_teacher_extract(
+                            teacher,
+                            originals,
+                            cls_threshold=float(args.pseudo_threshold),
+                            rng=rng,
+                        )
+                        extra["candidates"] += int(statistics.get("candidates", 0))
+                        extra["accepted"] += int(statistics.get("accepted", 0))
+                        running_stats["total_candidates"] += int(statistics.get("candidates", 0))
+                        running_stats["total_accepted"] += int(statistics.get("accepted", 0))
+                        running_stats["total_quality_sum"] += float(statistics.get("quality_sum", 0.0))
+
+                        aug_images, aug_targets, flips, reg_valid_list = [], [], [], []
+                        for img, (_, target), p in zip(originals, batch_u, st_pseudo):
+                            flip = rng.random() < 0.5
+                            brightness = rng.uniform(0.70, 1.30)
+                            contrast = rng.uniform(0.70, 1.30)
+                            pt = target_for_training(p, image_id=int(target["image_id"]))
+                            a_img, trans = strong_view(img, pt, flip=flip, brightness=brightness, contrast=contrast)
+                            aug_images.append(a_img)
+                            aug_targets.append(target_for_training(trans, image_id=int(target["image_id"])))
+                            flips.append(flip)
+                            reg_valid_list.append(p["reg_valid"])
+
+                        with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
+                            st_loss, st_extra = soft_teacher_unsupervised_loss(
+                                model, teacher, aug_images, aug_targets, flips, reg_valid_list, t_cache
+                            )
+                            if st_loss is not None:
+                                micro_total = micro_total + args.unsup_weight * st_loss
+                            unsup_sum += float(st_extra.get("unsup", 0.0)) / grad_accum
+
+                    elif args.variant == "consistent_teacher":
+                        teacher.eval()
+                        with torch.no_grad():
+                            raw_preds = teacher(originals)
+                        aug_images, aug_targets = [], []
+                        for img, (_, target), pred in zip(originals, batch_u, raw_preds):
+                            scores = pred["scores"]
+                            labels = pred["labels"]
+                            boxes = pred["boxes"]
+                            s_list = scores.detach().cpu().tolist()
+                            l_list = labels.detach().cpu().tolist()
+                            gmm_threshold.update_and_fit(l_list, s_list)
+                            keep = [
+                                j for j, (cls_id, sc) in enumerate(zip(l_list, s_list))
+                                if math.isfinite(sc) and sc >= gmm_threshold.threshold_for(cls_id)
+                            ]
+                            extra["candidates"] += len(s_list)
+                            extra["accepted"] += len(keep)
+                            running_stats["total_candidates"] += len(s_list)
+                            running_stats["total_accepted"] += len(keep)
+                            if keep:
+                                sel = torch.tensor(keep, dtype=torch.long, device=boxes.device)
+                                z1 = {"boxes": boxes[sel].detach(), "labels": labels[sel].detach(), "scores": scores[sel].detach()}
+                                running_stats["total_quality_sum"] += float(scores[sel].sum().item())
+                            else:
+                                z1 = {
+                                    "boxes": boxes.new_zeros((0, 4)),
+                                    "labels": labels.new_zeros((0,), dtype=torch.long),
+                                    "scores": scores.new_zeros((0,)),
+                                }
+                            empty_z2 = {"boxes": boxes.new_zeros((0, 4))}
+                            a_img, a_z1, _ = strong_view_care(img, z1, empty_z2, rng=rng, enable_cutout=True)
+                            aug_images.append(a_img)
+                            aug_targets.append(target_for_training(a_z1, image_id=int(target["image_id"])))
+                        if any(len(t["boxes"]) > 0 for t in aug_targets):
+                            with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
+                                unsup_losses = model(aug_images, aug_targets)
+                                unsupervised = sum(unsup_losses.values())
+                                micro_total = micro_total + args.unsup_weight * unsupervised
+                                unsup_sum += float(unsupervised.detach()) / grad_accum
+
+                    else:
+                        attributes = [attrs.get(unlabeled.images[idx]["file_name"], {}) for idx in ids]
+                        pseudo, statistics = pseudo_targets(
+                            teacher, originals, variant=args.variant, threshold=args.pseudo_threshold,
+                            min_quality=args.min_quality, localization_scale=args.localization_scale,
+                            agreement_iou=args.agreement_iou, counts=counts,
+                            localization_enabled=bool(args.localization_enabled),
+                            adaptive_strength=args.adaptive_strength, attrs_list=attributes,
+                            condition_offset=args.condition_offset)
+                        extra["candidates"] += int(statistics.get("candidates", 0))
+                        extra["accepted"] += int(statistics.get("accepted", 0))
+                        extra["quality_sum"] = float(extra.get("quality_sum", 0.0)) + float(statistics.get("quality_sum", 0.0))
+                        running_stats["total_candidates"] += int(statistics.get("candidates", 0))
+                        running_stats["total_accepted"] += int(statistics.get("accepted", 0))
+                        running_stats["total_quality_sum"] += float(statistics.get("quality_sum", 0.0))
+
+                        augmented = []
+                        for img, (_, target), p in zip(originals, batch_u, pseudo):
+                            flip = rng.random() < 0.5
+                            brightness = rng.uniform(0.75, 1.25)
+                            contrast = rng.uniform(0.75, 1.25)
+                            pseudo_target = target_for_training(p, image_id=int(target["image_id"]))
+                            img, trans = strong_view(img, pseudo_target, flip=flip,
+                                                     brightness=brightness, contrast=contrast)
+                            trans["scores"] = p["scores"]
+                            trans["uncertainty"] = p["uncertainty"]
+                            augmented.append((img, trans))
+                        if any(len(t["boxes"]) > 0 for _, t in augmented):
+                            aug_images = [item[0] for item in augmented]
+                            aug_targets = [target_for_training(item[1], image_id=int(item[1]["image_id"]))
+                                           for item in augmented]
+                            with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
+                                unsup_losses = model(aug_images, aug_targets)
+                                unsupervised = sum(unsup_losses.values())
+                                micro_total = micro_total + args.unsup_weight * unsupervised
+                                unsup_sum += float(unsupervised.detach()) / grad_accum
+                                if args.variant == "full" and args.consistency_weight:
+                                    stability = consistency_roi_loss(
+                                        model, aug_images, [t for _, t in augmented],
+                                        box_weight=args.box_weight, class_weight=args.class_weight,
+                                        confidence_weight=args.confidence_weight,
+                                        reliability_scale=args.localization_scale)
+                                    if stability:
+                                        stab_total = sum(stability.values())
+                                        micro_total = micro_total + args.consistency_weight * stab_total
+                                        stab_sum += float(stab_total.detach()) / grad_accum
+
+                if not torch.isfinite(micro_total):
+                    raise RuntimeError(f"non-finite loss at step {step + 1} (micro {micro + 1}/{grad_accum})")
+                step_loss_sum += float(micro_total.detach()) / grad_accum
+                scaler.scale(micro_total / float(grad_accum)).backward()
+
+            extra["sup"] = sup_sum
+            extra["unsup"] = unsup_sum
+            extra["stability"] = stab_sum
+
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
             scaler.step(optimizer)
@@ -1115,9 +1361,12 @@ def _train_locked(args, out: Path):
 
             current_step = step + 1
             steps_this_call += 1
+            if conformal_calibrator is not None and current_step % args.conformal_every == 0 and current_step < args.steps:
+                _run_conformal_calibration(current_step)
+
             entry = {
                 "step": current_step,
-                "loss": round(float(total.detach()), 7),
+                "loss": round(step_loss_sum, 7),
                 "lr": float(optimizer.param_groups[0]["lr"]),
                 "seconds": round(time.monotonic() - started, 2),
                 **extra,

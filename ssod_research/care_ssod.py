@@ -303,6 +303,8 @@ def extract_teacher_tri_zone_targets(
         vis = estimate_visibility_degradation(image)
         regime = str(vis["regime"])
         deg_scores.append(float(vis["degradation"]))
+        if hasattr(calibrator, "observe_unlabeled_visibility"):
+            calibrator.observe_unlabeled_visibility(float(vis["degradation"]), regime)
 
         boxes = pred["boxes"]
         labels = pred["labels"]
