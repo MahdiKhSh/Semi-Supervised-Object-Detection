@@ -29,8 +29,8 @@ if (-not $installed -and -not $SkipTorchInstall) {
 if ($LASTEXITCODE -ne 0) { throw "Research dependencies could not be installed" }
 & $venvPython scripts/check_environment.py
 if ($LASTEXITCODE -ne 0) { throw "Environment diagnostic failed" }
-& $venvPython -c "import torch; assert torch.cuda.is_available(); assert torch.cuda.get_device_capability(0)[0] >= 12; x=torch.randn((128,128),device='cuda'); assert (x@x).isfinite().all().item(); print('CUDA Blackwell runtime OK')"
-if ($LASTEXITCODE -ne 0 -and -not $AllowCpuOnly) { throw "CUDA/RTX 5090 verification failed. No training started." }
+& $venvPython -c "import torch; assert torch.cuda.is_available(); cap=torch.cuda.get_device_capability(0); x=torch.randn((128,128),device='cuda'); assert (x@x).isfinite().all().item(); print(f'CUDA runtime OK: {torch.cuda.get_device_name(0)} (sm_{cap[0]}{cap[1]})')"
+if ($LASTEXITCODE -ne 0 -and -not $AllowCpuOnly) { throw "CUDA GPU verification failed. No training started." }
 & $venvPython -m pytest -q
 if ($LASTEXITCODE -ne 0) { throw "Unit tests failed. No training started." }
 Write-Host "Environment verified. Setup did not start model training."

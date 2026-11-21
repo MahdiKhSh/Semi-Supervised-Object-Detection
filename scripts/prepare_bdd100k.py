@@ -2,17 +2,28 @@
 """Convert BDD100K 2D detection labels and create leakage-safe SSOD splits.
 
 Inputs: official BDD100K image-label JSON (list of records). Never reads
-validation labels for training. Reports are descriptive, not benchmarks.
+validation labels for training. All outputs are written atomically, with
+``split_manifest.json`` written last as the crash-safe commit record.
 """
 from __future__ import annotations
+
 import argparse
 import hashlib
 import json
 from pathlib import Path
 import random
+import sys
 
-CATEGORIES = ("pedestrian", "rider", "car", "truck", "bus", "train",
-              "motorcycle", "bicycle", "traffic light", "traffic sign")
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from ssod_research.recovery import atomic_write_json, atomic_write_text, sha256_file, stable_hash
+
+CATEGORIES = (
+    "pedestrian", "rider", "car", "truck", "bus", "train",
+    "motorcycle", "bicycle", "traffic light", "traffic sign",
+)
 CAT2ID = {name: i + 1 for i, name in enumerate(CATEGORIES)}
 
 
@@ -38,12 +49,16 @@ def convert(records, include_annotations=True):
             y1, y2 = sorted((max(0, min(height, y1)), max(0, min(height, y2))))
             if x2 <= x1 or y2 <= y1:
                 continue
-            annotations.append({"id": len(annotations) + 1, "image_id": image_id,
-                                "category_id": CAT2ID[cls], "bbox": [x1, y1, x2-x1, y2-y1],
-                                "area": (x2-x1)*(y2-y1), "iscrowd": 0})
-    return {"info": {"description": "BDD100K RGB 2D detection COCO conversion"},
-            "licenses": [], "images": images, "annotations": annotations,
-            "categories": [{"id": idx, "name": name} for name, idx in CAT2ID.items()]}
+            annotations.append({
+                "id": len(annotations) + 1, "image_id": image_id,
+                "category_id": CAT2ID[cls], "bbox": [x1, y1, x2 - x1, y2 - y1],
+                "area": (x2 - x1) * (y2 - y1), "iscrowd": 0,
+            })
+    return {
+        "info": {"description": "BDD100K RGB 2D detection COCO conversion"},
+        "licenses": [], "images": images, "annotations": annotations,
+        "categories": [{"id": idx, "name": name} for name, idx in CAT2ID.items()],
+    }
 
 
 def build_splits(train_records, fraction=0.10, seed=42):
@@ -55,7 +70,7 @@ def build_splits(train_records, fraction=0.10, seed=42):
     ordered = sorted(train_records, key=lambda item: item["name"])
     rng = random.Random(seed)
     rng.shuffle(ordered)
-    n = max(1, min(len(ordered)-1, round(len(ordered)*fraction)))
+    n = max(1, min(len(ordered) - 1, round(len(ordered) * fraction)))
     if n < 1 or n >= len(ordered):
         raise ValueError("need at least one labeled and one unlabeled image")
     labeled, unlabeled = ordered[:n], ordered[n:]
@@ -63,14 +78,46 @@ def build_splits(train_records, fraction=0.10, seed=42):
     return labeled, unlabeled
 
 
-def main():
+def verify_split_output(split_dir: Path, *, train_labels: Path, val_labels: Path,
+                        fraction: float, seed: int) -> tuple[bool, str, dict | None]:
+    """Verify split manifest + all annotation files & checksums."""
+    manifest_path = split_dir / "split_manifest.json"
+    if not manifest_path.is_file():
+        return False, "split_manifest.json missing", None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return False, f"split_manifest.json unreadable: {exc}", None
+    if float(manifest.get("label_fraction", -1)) != float(fraction):
+        return False, f"fraction mismatch ({manifest.get('label_fraction')} != {fraction})", manifest
+    if int(manifest.get("seed", -1)) != int(seed):
+        return False, f"seed mismatch ({manifest.get('seed')} != {seed})", manifest
+    if train_labels.is_file():
+        if sha256_file(train_labels) != manifest.get("train_source_sha256"):
+            return False, "train source labels changed", manifest
+    if val_labels.is_file():
+        if sha256_file(val_labels) != manifest.get("val_source_sha256"):
+            return False, "val source labels changed", manifest
+    ann_dir = split_dir / "annotations"
+    required = ("labeled.json", "unlabeled.json", "val.json", "train_attributes.json")
+    recorded = manifest.get("artifact_sha256") or {}
+    for name in required:
+        file_path = ann_dir / name
+        if not file_path.is_file():
+            return False, f"missing annotation file: {name}", manifest
+        if name in recorded and sha256_file(file_path, use_cache=False) != recorded[name]:
+            return False, f"corrupted annotation file: {name}", manifest
+    return True, "verified", manifest
+
+
+def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--train-labels", required=True, type=Path)
     p.add_argument("--val-labels", required=True, type=Path)
     p.add_argument("--output", required=True, type=Path)
     p.add_argument("--fraction", type=float, default=0.10)
     p.add_argument("--seed", type=int, default=42)
-    args = p.parse_args()
+    args = p.parse_args(argv)
     train = json.loads(args.train_labels.read_text(encoding="utf-8"))
     val = json.loads(args.val_labels.read_text(encoding="utf-8"))
     if not isinstance(train, list) or not isinstance(val, list):
@@ -87,20 +134,35 @@ def main():
         "val.json": convert(val, True),
     }
     attributes = {r["name"]: r.get("attributes", {}) for r in train}
-    (ann_dir / "train_attributes.json").write_text(json.dumps(attributes, separators=(",", ":")), encoding="utf-8")
+    artifact_sha256 = {}
+    attr_path = ann_dir / "train_attributes.json"
+    atomic_write_text(attr_path, json.dumps(attributes, separators=(",", ":")))
+    artifact_sha256["train_attributes.json"] = sha256_file(attr_path, use_cache=False)
     for filename, obj in outputs.items():
-        (ann_dir / filename).write_text(json.dumps(obj, separators=(",", ":")), encoding="utf-8")
+        dest = ann_dir / filename
+        atomic_write_text(dest, json.dumps(obj, separators=(",", ":")))
+        artifact_sha256[filename] = sha256_file(dest, use_cache=False)
+    train_src_sha = sha256_file(args.train_labels, use_cache=False)
+    val_src_sha = sha256_file(args.val_labels, use_cache=False)
     report = {
-        "seed": args.seed, "label_fraction": args.fraction,
-        "labeled_images": len(labeled), "unlabeled_images": len(unlabeled),
+        "seed": args.seed,
+        "label_fraction": args.fraction,
+        "labeled_images": len(labeled),
+        "unlabeled_images": len(unlabeled),
         "validation_images": len(val),
         "labeled_name_sha256": hashlib.sha256("\n".join(sorted(x["name"] for x in labeled)).encode()).hexdigest(),
-        "train_source_sha256": hashlib.sha256(args.train_labels.read_bytes()).hexdigest(),
-        "val_source_sha256": hashlib.sha256(args.val_labels.read_bytes()).hexdigest(),
+        "train_source_sha256": train_src_sha,
+        "val_source_sha256": val_src_sha,
+        "artifact_sha256": artifact_sha256,
+        "split_fingerprint": stable_hash({
+            "seed": args.seed,
+            "fraction": args.fraction,
+            "artifact_sha256": artifact_sha256,
+        }),
         "classes": list(CATEGORIES),
-        "warning": "Potential consecutive-frame leakage: split by drive/video IDs if grouping metadata is available."
+        "warning": "Potential consecutive-frame leakage: split by drive/video IDs if grouping metadata is available.",
     }
-    (args.output / "split_manifest.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    atomic_write_json(args.output / "split_manifest.json", report)
     print(json.dumps(report, indent=2))
 
 

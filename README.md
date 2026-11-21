@@ -20,23 +20,48 @@ training on BDD100K. Scientific novelty is not yet established.
    consistency, threshold sweeps and on/off ablations.
 
 The paper preset can be extremely time-consuming on one GPU. Runs save
-checkpoints, logs, class/condition AP diagnostics and a cumulative results
-CSV/JSON report. Re-running the same launcher resumes. Nothing changes RDP,
-firewall, VPN or system GPU driver.
+rolling SHA-256 verified checkpoints, SQLite experiment state, logs,
+class/condition AP diagnostics, and cumulative CSV/JSON/Markdown reports.
+Re-running the same launcher (or double-clicking **RUN_RESUME.cmd**)
+resumes automatically without redoing completed work.
+
+### Recovery, status, and cross-GPU (Kaggle / Colab / L40s / RTX 5090)
+
+- **RUN_RESUME.cmd**: Resume the previously selected suite from its last valid checkpoint.
+- **RUN_STATUS.cmd**: Inspect progress, steps, runtime, ETA, and resume command without launching training.
+- **RUN_BENCHMARK.cmd**: Run a resumable GPU/CPU throughput benchmark only.
+- **CLI shortcuts**:
+  ```powershell
+  python scripts/run_suite.py --preset core --resume
+  python scripts/run_suite.py --preset paper --resume
+  python scripts/run_suite.py --preset core --status
+  python scripts/run_suite.py --preset core --dry-run
+  ```
+- **Cloud / Multi-GPU transfer (Kaggle -> L40s -> RTX 5090)**: Use `notebooks/run_ssod_cloud.ipynb` or `scripts/run_cloud.sh`, transfer checkpoints safely via `scripts/sync_workspace.py export` / `import`, and pass `--sync-github` to push lightweight results and `docs/PROJECT_PROGRESS.md` to GitHub without committing weights or datasets.
+
+Nothing changes RDP, firewall, VPN or system GPU driver.
 
 ## Key modules
 
 | Component | File |
 |---|---|
 | Primary native PyTorch/TorchVision trainer | ssod_research/native_training.py |
+| Atomic checkpoints, SHA-256 sidecars, file locks, RNG | ssod_research/recovery.py |
+| Transactional SQLite experiment registry | ssod_research/registry.py |
+| 15-stage dependency DAG & progress/ETA reporting | ssod_research/pipeline.py |
+| Cross-GPU bundle transfer, cloud lease & GitHub sync | ssod_research/cloud_sync.py |
 | Resize, image/box transform, COCO data loading | ssod_research/native_data.py |
 | Geometric mappings and class-matched IoU | ssod_research/geometry.py |
 | Differentiable box/class/confidence stability loss | ssod_research/consistency.py |
 | BDD100K labeled/unlabeled train split | scripts/prepare_bdd100k.py |
 | End-to-end resumable experiment orchestrator | scripts/run_suite.py |
+| Resumable GPU/CPU benchmark | scripts/benchmark_gpu.py |
+| Cross-machine bundle & GitHub sync CLI | scripts/sync_workspace.py |
+| Cloud notebook & Linux runner | notebooks/run_ssod_cloud.ipynb, scripts/run_cloud.sh |
 | Synthetic smoke data fixture | scripts/make_synthetic_bdd.py |
 | COCO scene/time/weather AP | scripts/eval_conditions.py |
 | Native Windows setup and launchers | scripts/setup_windows.ps1, RUN_*.cmd |
+| Progress, decisions & Codex continuity docs | docs/PROJECT_PROGRESS.md, docs/DECISIONS.md, docs/CODEX_HANDOFF.md |
 | Paper protocol (zero to publication) | docs/PAPER_ROADMAP_0_TO_100.md |
 | Prior-art matrix | docs/LITERATURE.md |
 | Optional original MMDetection SoftTeacher extension | configs/, ssod_research/mmdet_extension.py |
