@@ -8,10 +8,51 @@ from __future__ import annotations
 
 from collections import defaultdict
 import json
+import os
 from pathlib import Path
 from PIL import Image
 import torch
 import torchvision.transforms.functional as TF
+
+_IMAGE_INDEX_CACHE: dict[str, dict[str, Path]] = {}
+
+
+def build_image_index(image_dir: Path | str, *, force_refresh: bool = False) -> dict[str, Path]:
+    """Build (and cache) a filename -> Path index recursively under ``image_dir``.
+
+    Supports both flat BDD100K layouts (``100k/train/<name>.jpg``) and nested
+    Kaggle/mirror layouts (e.g. ``100k/train/trainA/<name>.jpg``,
+    ``100k/train/trainB/<name>.jpg``).
+    """
+    root = Path(image_dir).resolve()
+    key = str(root)
+    if not force_refresh and key in _IMAGE_INDEX_CACHE:
+        return _IMAGE_INDEX_CACHE[key]
+    index: dict[str, Path] = {}
+    if root.is_dir():
+        for dirpath, _dirnames, filenames in os.walk(root):
+            base = Path(dirpath)
+            rel_dir = base.relative_to(root)
+            for fname in filenames:
+                full = base / fname
+                rel_posix = (rel_dir / fname).as_posix() if str(rel_dir) != "." else fname
+                index.setdefault(rel_posix, full)
+                index.setdefault(fname, full)
+    _IMAGE_INDEX_CACHE[key] = index
+    return index
+
+
+def resolve_image_path(image_dir: Path | str, file_name: str) -> Path | None:
+    """Resolve ``file_name`` directly under ``image_dir`` or recursively in subdirectories."""
+    root = Path(image_dir)
+    direct = root / file_name
+    if direct.is_file():
+        return direct
+    index = build_image_index(root)
+    found = index.get(file_name) or index.get(Path(file_name).name)
+    if found is not None and found.is_file():
+        return found
+    return None
 
 
 class RoadCocoDataset:
@@ -45,9 +86,9 @@ class RoadCocoDataset:
 
     def __getitem__(self, idx):
         info = self.images[idx]
-        path = self.image_dir / info["file_name"]
-        if not path.is_file():
-            raise FileNotFoundError(f"image not found: {path}")
+        path = resolve_image_path(self.image_dir, info["file_name"])
+        if path is None:
+            raise FileNotFoundError(f"image not found: {self.image_dir / info['file_name']}")
         with Image.open(path) as pil:
             image = pil.convert("RGB")
         w, h = image.size
@@ -107,7 +148,8 @@ def image_inventory_check(annotation_file, image_dir, *, check_every_image=True)
     if len(names) != len(set(names)):
         raise ValueError("duplicate image filenames")
     candidates = names if check_every_image else names[:50]
-    missing = [name for name in candidates if not (Path(image_dir) / name).is_file()]
+    root = Path(image_dir)
+    missing = [name for name in candidates if resolve_image_path(root, name) is None]
     if missing:
         raise FileNotFoundError(f"{len(missing)} missing images, first examples: {missing[:5]}")
     return {"count": len(names), "annotations": len(obj.get("annotations", [])), "image_directory": str(image_dir)}

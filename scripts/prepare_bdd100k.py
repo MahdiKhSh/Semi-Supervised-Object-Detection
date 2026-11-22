@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import random
 import sys
@@ -78,8 +79,26 @@ def build_splits(train_records, fraction=0.10, seed=42):
     return labeled, unlabeled
 
 
+def _available_image_names(image_dir: Path) -> set[str]:
+    """Recursively collect image filenames under ``image_dir`` (supports nested subdirs)."""
+    root = Path(image_dir).resolve()
+    names: set[str] = set()
+    if not root.is_dir():
+        return names
+    for dirpath, _dirnames, filenames in os.walk(root):
+        base = Path(dirpath)
+        rel_dir = base.relative_to(root)
+        for fname in filenames:
+            names.add(fname)
+            if str(rel_dir) != ".":
+                names.add((rel_dir / fname).as_posix())
+    return names
+
+
 def verify_split_output(split_dir: Path, *, train_labels: Path, val_labels: Path,
-                        fraction: float, seed: int) -> tuple[bool, str, dict | None]:
+                        fraction: float, seed: int,
+                        train_images: Path | None = None,
+                        val_images: Path | None = None) -> tuple[bool, str, dict | None]:
     """Verify split manifest + all annotation files & checksums."""
     manifest_path = split_dir / "split_manifest.json"
     if not manifest_path.is_file():
@@ -107,6 +126,18 @@ def verify_split_output(split_dir: Path, *, train_labels: Path, val_labels: Path
             return False, f"missing annotation file: {name}", manifest
         if name in recorded and sha256_file(file_path, use_cache=False) != recorded[name]:
             return False, f"corrupted annotation file: {name}", manifest
+    # If an older unfiltered split contains images missing from the current image directory
+    # (e.g. partial Kaggle mirror), trigger a clean re-prepare on --resume.
+    if train_images is not None and Path(train_images).is_dir() and not manifest.get("image_inventory_filtered"):
+        avail_train = _available_image_names(Path(train_images))
+        labeled_obj = json.loads((ann_dir / "labeled.json").read_text(encoding="utf-8"))
+        if any(im["file_name"] not in avail_train for im in labeled_obj.get("images", [])):
+            return False, "split contains train images missing from image_dir; re-prepare required", manifest
+    if val_images is not None and Path(val_images).is_dir() and not manifest.get("image_inventory_filtered"):
+        avail_val = _available_image_names(Path(val_images))
+        val_obj = json.loads((ann_dir / "val.json").read_text(encoding="utf-8"))
+        if any(im["file_name"] not in avail_val for im in val_obj.get("images", [])):
+            return False, "split contains val images missing from image_dir; re-prepare required", manifest
     return True, "verified", manifest
 
 
@@ -114,6 +145,10 @@ def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--train-labels", required=True, type=Path)
     p.add_argument("--val-labels", required=True, type=Path)
+    p.add_argument("--train-images", type=Path, default=None,
+                   help="Optional train image directory; when set, filters labels to images present on disk.")
+    p.add_argument("--val-images", type=Path, default=None,
+                   help="Optional val image directory; when set, filters labels to images present on disk.")
     p.add_argument("--output", required=True, type=Path)
     p.add_argument("--fraction", type=float, default=0.10)
     p.add_argument("--seed", type=int, default=42)
@@ -122,6 +157,44 @@ def main(argv=None):
     val = json.loads(args.val_labels.read_text(encoding="utf-8"))
     if not isinstance(train, list) or not isinstance(val, list):
         raise ValueError("BDD labels must be JSON lists")
+
+    dropped_train = 0
+    dropped_val = 0
+    if args.train_images is not None and args.train_images.is_dir():
+        avail_train = _available_image_names(args.train_images)
+        before = len(train)
+        train = [r for r in train if r["name"] in avail_train or Path(r["name"]).name in avail_train]
+        dropped_train = before - len(train)
+        if len(train) < 2:
+            raise FileNotFoundError(
+                f"Only {len(train)} of {before} train label images found under {args.train_images} "
+                f"({len(avail_train)} files indexed). Check --train-images path."
+            )
+        if dropped_train > 0:
+            print(
+                f"WARNING: Filtered out {dropped_train} train label records missing from {args.train_images} "
+                f"(kept {len(train)} available images).",
+                file=sys.stderr,
+                flush=True,
+            )
+    if args.val_images is not None and args.val_images.is_dir():
+        avail_val = _available_image_names(args.val_images)
+        before = len(val)
+        val = [r for r in val if r["name"] in avail_val or Path(r["name"]).name in avail_val]
+        dropped_val = before - len(val)
+        if len(val) < 1:
+            raise FileNotFoundError(
+                f"Only {len(val)} of {before} val label images found under {args.val_images} "
+                f"({len(avail_val)} files indexed). Check --val-images path."
+            )
+        if dropped_val > 0:
+            print(
+                f"WARNING: Filtered out {dropped_val} val label records missing from {args.val_images} "
+                f"(kept {len(val)} available images).",
+                file=sys.stderr,
+                flush=True,
+            )
+
     names_train, names_val = {r["name"] for r in train}, {r["name"] for r in val}
     if names_train.intersection(names_val):
         raise ValueError("train and validation images overlap")
@@ -150,6 +223,9 @@ def main(argv=None):
         "labeled_images": len(labeled),
         "unlabeled_images": len(unlabeled),
         "validation_images": len(val),
+        "image_inventory_filtered": bool(args.train_images or args.val_images),
+        "dropped_missing_train_images": dropped_train,
+        "dropped_missing_val_images": dropped_val,
         "labeled_name_sha256": hashlib.sha256("\n".join(sorted(x["name"] for x in labeled)).encode()).hexdigest(),
         "train_source_sha256": train_src_sha,
         "val_source_sha256": val_src_sha,

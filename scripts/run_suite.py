@@ -346,6 +346,10 @@ def generate_jobs(args):
             "--fraction", str(fraction),
             "--seed", str(seed),
         ]
+        if args.train_images:
+            prepare_cmd += ["--train-images", str(args.train_images)]
+        if args.val_images:
+            prepare_cmd += ["--val-images", str(args.val_images)]
         jobs.append({
             "name": f"{frac_tag}_s{seed}/prepare",
             "type": "prepare",
@@ -712,6 +716,8 @@ def job_complete(job):
         split_dir = Path(job["output"]).parent
         train_labels = Path(_flag(job["command"], "train_labels"))
         val_labels = Path(_flag(job["command"], "val_labels"))
+        train_images_flag = _flag(job["command"], "train_images")
+        val_images_flag = _flag(job["command"], "val_images")
         fraction = float(_flag(job["command"], "fraction"))
         seed = int(_flag(job["command"], "seed"))
         ok, reason, manifest = verify_split_output(
@@ -720,6 +726,8 @@ def job_complete(job):
             val_labels=val_labels,
             fraction=fraction,
             seed=seed,
+            train_images=Path(train_images_flag) if train_images_flag else None,
+            val_images=Path(val_images_flag) if val_images_flag else None,
         )
         if not ok and manifest is not None and ("mismatch" in reason or "source labels changed" in reason):
             raise RuntimeError(f"Split mismatch for {split_dir}: {reason}")
