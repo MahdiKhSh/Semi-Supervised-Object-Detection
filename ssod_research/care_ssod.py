@@ -615,13 +615,25 @@ def care_unsupervised_loss(
 
     # 1. Zone-1 supervised-style detection loss with Zone-2 background suppression
     if has_z1 and transformed_targets is not None:
-        proposals, rpn_losses = model.rpn(transformed, features, transformed_targets)
+        # A missing pseudo-label is unknown foreground, not a negative image.
+        # Retain the full feature maps below for Zone-2-only distillation.
+        positive = [i for i, target in enumerate(transformed_targets) if len(target["boxes"])]
+        det_images, det_features, det_targets = transformed, features, transformed_targets
+        det_ambiguous = ambig_trans
+        if len(positive) != len(aug_images):
+            from torchvision.models.detection.image_list import ImageList
+
+            det_images = ImageList(transformed.tensors[positive], [transformed.image_sizes[i] for i in positive])
+            det_features = {k: v[positive] for k, v in features.items()}
+            det_targets = [transformed_targets[i] for i in positive]
+            det_ambiguous = [ambig_trans[i] for i in positive]
+        proposals, rpn_losses = model.rpn(det_images, det_features, det_targets)
         if use_tri_zone and has_z2:
-            pos_trans = [t["boxes"].detach() for t in transformed_targets]
+            pos_trans = [t["boxes"].detach() for t in det_targets]
             proposals, suppressed_bg = filter_ambiguous_background_proposals(
-                proposals, pos_trans, ambig_trans
+                proposals, pos_trans, det_ambiguous
             )
-        _, roi_losses = model.roi_heads(features, proposals, transformed.image_sizes, transformed_targets)
+        _, roi_losses = model.roi_heads(det_features, proposals, det_images.image_sizes, det_targets)
         det_total = sum(rpn_losses.values()) + sum(roi_losses.values())
         total = det_total
         det_loss_val = float(det_total.detach())

@@ -49,7 +49,7 @@ def split_calibration_indices(
     """
     n = int(dataset_size)
     if n < 2:
-        return list(range(n)), list(range(n))
+        return list(range(n)), []
     indices = list(range(n))
     rng = random.Random(int(seed) * 9973 + 17)
     rng.shuffle(indices)
@@ -341,7 +341,7 @@ class WeightedConformalRiskCalibrator:
         per_class_curves: dict[int, list[tuple[list[float], float]]] = {
             c: [] for c in range(1, self.num_classes + 1)
         }
-        total_gt = 0
+        gt_by_regime = {"clear": 0, "degraded": 0}
         all_det_records: list[tuple[float, int, str]] = []
 
         teacher.eval()
@@ -399,7 +399,7 @@ class WeightedConformalRiskCalibrator:
             reliability = scores * torch.exp(-loc_alpha * u_loc - cls_alpha * u_cls)
             gt_boxes = target["boxes"].to(device)
             gt_labels = target["labels"].to(device)
-            total_gt += len(gt_boxes)
+            gt_by_regime[regime_i] += len(gt_boxes)
 
             tp_flags = _match_detections_to_gt(
                 boxes, labels, reliability, gt_boxes, gt_labels, iou_thresh=self.iou_match
@@ -426,7 +426,7 @@ class WeightedConformalRiskCalibrator:
         diagnostics: dict[str, Any] = {
             "step": int(step),
             "cal_images": len(chosen),
-            "cal_gt_boxes": int(total_gt),
+            "cal_gt_boxes": sum(gt_by_regime.values()),
             "alpha_strict": self.alpha_strict,
             "alpha_loose": self.alpha_loose,
             "unlabeled_degraded_frac": round(
@@ -477,13 +477,15 @@ class WeightedConformalRiskCalibrator:
 
             # Compute empirical pooled recall and FDR at tau_high for diagnostic plots
             tau_h = self.regime_high[regime]
-            acc_recs = [r for r in all_det_records if r[0] >= tau_h]
+            acc_recs = [r for r in all_det_records if r[2] == regime and r[0] >= tau_h]
             emp_fdr = (
                 sum(1 - r[1] for r in acc_recs) / len(acc_recs)
                 if acc_recs else 0.0
             )
-            emp_recall = sum(r[1] for r in acc_recs) / max(1, total_gt)
+            emp_recall = sum(r[1] for r in acc_recs) / max(1, gt_by_regime[regime])
             diagnostics["regimes"][regime] = {
+                "ground_truth_boxes": gt_by_regime[regime],
+                "accepted_detections": len(acc_recs),
                 "tau_high": round(self.regime_high[regime], 4),
                 "tau_low": round(self.regime_low[regime], 4),
                 "empirical_weighted_risk": sol_hi["empirical_risk"],

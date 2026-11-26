@@ -157,6 +157,15 @@ def test_care_unsupervised_loss_handles_zone1_and_zone2_only_batches():
     assert loss is not None and torch.isfinite(loss).item()
     assert stats["stability"] > 0.0
     loss.backward()
+
+    rpn_batches = []
+    model.rpn.register_forward_pre_hook(lambda _, args: rpn_batches.append(len(args[0].image_sizes)))
+    loss, stats = care_unsupervised_loss(
+        model, [img, img], [target_for_training(z2, image_id=2), target_for_training(empty_z1, image_id=3)],
+        [z2, empty_z1], [empty_z1, z2],
+    )
+    assert rpn_batches == [1] and stats["stability"] > 0 and torch.isfinite(loss)
+    loss.backward()
     assert model.roi_heads.box_predictor.cls_score.weight.grad.abs().sum() > 0
 
 

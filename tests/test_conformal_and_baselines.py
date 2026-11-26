@@ -17,6 +17,7 @@ if str(ROOT / "scripts") not in sys.path:
 def test_split_calibration_indices_disjoint_and_deterministic():
     from ssod_research.conformal import split_calibration_indices
 
+    assert split_calibration_indices(1) == ([0], [])
     tr1, cal1 = split_calibration_indices(100, seed=42, cal_fraction=0.08, max_cal=256)
     tr2, cal2 = split_calibration_indices(100, seed=42, cal_fraction=0.08, max_cal=256)
     assert tr1 == tr2 and cal1 == cal2
@@ -100,7 +101,7 @@ def test_soft_teacher_extract_and_soft_negative_loss_gradients():
 
     # Extract with low cls_threshold so untrained random teacher produces candidates
     pseudo, stats, cache = soft_teacher_extract(
-        teacher, [img], cls_threshold=0.01, reg_threshold=0.01, jitter_times=2, jitter_thresh=1.0, rng=random.Random(3),
+        teacher, [img, img], cls_threshold=0.01, reg_threshold=0.01, jitter_times=2, jitter_thresh=1.0, rng=random.Random(3),
     )
     assert stats["candidates"] >= 0
     if len(pseudo[0]["boxes"]) == 0:
@@ -113,9 +114,14 @@ def test_soft_teacher_extract_and_soft_negative_loss_gradients():
             "jitter_std": torch.tensor([0.01]),
         }
     target = target_for_training(pseudo[0], image_id=1)
+    empty = {"labels": torch.empty(0, dtype=torch.long), "boxes": torch.empty((0, 4))}
+    rpn_batches = []
+    student.rpn.register_forward_pre_hook(lambda _, args: rpn_batches.append(len(args[0].image_sizes)))
     loss, extra = soft_teacher_unsupervised_loss(
-        student, teacher, [img], [target], [True], [pseudo[0]["reg_valid"]], cache
+        student, teacher, [img, img], [empty, target], [False, True],
+        [torch.empty(0, dtype=torch.bool), pseudo[0]["reg_valid"]], cache
     )
+    assert rpn_batches == [1]
     assert loss is not None and torch.isfinite(loss).item()
     loss.backward()
     assert student.roi_heads.box_predictor.cls_score.weight.grad.abs().sum() > 0

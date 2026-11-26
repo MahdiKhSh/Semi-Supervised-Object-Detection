@@ -61,6 +61,29 @@ Target journals: **IEEE Transactions on Intelligent Transportation Systems (T-IT
 
 ---
 
+## A100 reference run
+
+From the repository root on the server, activate the existing PyTorch environment and update the research branch. The input plan supplies the four BDD paths used in the earlier pilot. The new output directory keeps its checkpoints separate.
+
+```bash
+git switch feat/research-baseline
+git pull --ff-only origin feat/research-baseline
+source /data/venvs/ssod/bin/activate
+python scripts/run_suite.py --preset q1_a100 --device cuda --amp bf16 \
+  --dataset-from-plan /data/outputs/q1_pilot_legacy_bs40/experiment_plan.json \
+  --output /data/outputs/q1_a100_reference_v1
+```
+
+If the old plan is unavailable, supply `--train-labels`, `--val-labels`, `--train-images` and `--val-images` directly. Repeat the same command to resume. To run just preparation, warm-up and the supervised control first, add `--run-limit 3` on the first invocation.
+
+The reference uses the 10% labeled split, seed 42, Faster R-CNN v2 with an ImageNet-pretrained ResNet-50, 800-pixel long side, micro-batch 2 and four accumulation steps. The shared supervised warm-up runs for 1,500 training steps. Its checkpoint initializes each of five 3,000-step runs. All branches reserve the same calibration fold before warm-up. Evaluation uses all images in the prepared validation split at steps 1,500 and 3,000, with final per-class and condition reports. The experiment plan records the generated commands. Each run manifest includes the source revision, dataset hashes, effective configuration and measured metrics in the adjacent `evaluations.jsonl`.
+
+Historical reference values on the 0–100 AP scale are 13.85 for warm-up, 17.81 for supervised and 18.15 for CoRe. The old validation IDs, effective batch and raw output are unavailable. Compare supervised and CoRe at the same step in this suite and record their difference in AP points. The historical difference was +0.34. A single seed measures this run only.
+
+For a checkpoint-level comparison, run `scripts/eval_external.py` twice with the same `--checkpoint`, validation `--coco-ann`, `--images` and `--max-side 800`. Select `--weights teacher` and `--weights student` with distinct `--output` directories. Use the same image limit for both.
+
+The supervised burn-in followed by EMA teacher updates follows the training sequence described in [Unbiased Teacher v2](https://openaccess.thecvf.com/content/CVPR2022/html/Liu_Unbiased_Teacher_v2_Semi-Supervised_Object_Detection_for_Anchor-Free_and_Anchor-Based_CVPR_2022_paper.html). The reference code omits images with zero accepted boxes from hard pseudo-label detection losses. CoRe can still use ambiguous boxes for soft distillation. This implementation choice targets the false-negative supervision described in [Data-Uncertainty Guided Multi-Phase Learning](https://openaccess.thecvf.com/content/CVPR2021/papers/Wang_Data-Uncertainty_Guided_Multi-Phase_Learning_for_Semi-Supervised_Object_Detection_CVPR_2021_paper.pdf).
+
 ## 4. Seamless Kaggle (Tonight) -> RTX 5090 / L40s (Tomorrow) Execution
 
 ### Step 1: Fast Validation Pilot First (~15 min on 5090 / ~45 min on Kaggle T4)

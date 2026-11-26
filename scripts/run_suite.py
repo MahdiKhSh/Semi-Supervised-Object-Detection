@@ -65,6 +65,7 @@ def _default_output_for_preset(preset: str) -> Path:
         "pilot": ROOT / "work_dirs" / "pilot_runs",
         "core": ROOT / "work_dirs" / "core_runs",
         "care": ROOT / "work_dirs" / "care_runs",
+        "q1_a100": ROOT / "work_dirs" / "q1_a100_runs",
         "q1_pilot": ROOT / "work_dirs" / "q1_pilot_runs",
         "q1_paper": ROOT / "work_dirs" / "q1_paper_runs",
         "paper": ROOT / "work_dirs" / "paper_runs",
@@ -76,15 +77,15 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Crash-safe resumable SSOD research orchestrator")
     p.add_argument(
         "--preset",
-        choices=("smoke", "pilot", "core", "care", "q1_pilot", "q1_paper", "paper"),
+        choices=("smoke", "pilot", "core", "care", "q1_pilot", "q1_a100", "q1_paper", "paper"),
         default="paper",
     )
     p.add_argument("--include-care", action="store_true",
                    help="Append proposed CaRe-SSOD / CoRe-SSOD variant to legacy presets")
-    p.add_argument("--train-labels", type=Path, default=ROOT / "data/bdd100k/raw/labels_train.json")
-    p.add_argument("--val-labels", type=Path, default=ROOT / "data/bdd100k/raw/labels_val.json")
-    p.add_argument("--train-images", type=Path, default=ROOT / "data/bdd100k/images/train")
-    p.add_argument("--val-images", type=Path, default=ROOT / "data/bdd100k/images/val")
+    p.add_argument("--train-labels", type=Path, default=None)
+    p.add_argument("--val-labels", type=Path, default=None)
+    p.add_argument("--train-images", type=Path, default=None)
+    p.add_argument("--val-images", type=Path, default=None)
     p.add_argument("--output", type=Path, default=None)
     p.add_argument("--warmup-steps", type=int, default=None)
     p.add_argument("--train-steps", type=int, default=None)
@@ -129,7 +130,20 @@ def parse_args(argv=None):
                    help="Mirror progress to docs/PROJECT_PROGRESS.md and work_dirs/ (auto when inside work_dirs/)")
     p.add_argument("--run-limit", type=int, default=0,
                    help="debugging: only execute first N primary jobs, not a full paper result")
+    p.add_argument("--dataset-from-plan", type=Path,
+                   help="Reuse only the four BDD input paths from a previous suite experiment_plan.json.")
     args = p.parse_args(argv)
+    if args.dataset_from_plan:
+        try:
+            previous = json.loads(args.dataset_from_plan.read_text(encoding="utf8"))
+            prepare = next(job["command"] for job in previous["jobs"] if job["type"] == "prepare")
+            for key in ("train_labels", "val_labels", "train_images", "val_images"):
+                flag = "--" + key.replace("_", "-")
+                value = Path(prepare[prepare.index(flag) + 1])
+                if getattr(args, key) is None:
+                    setattr(args, key, value)
+        except (OSError, ValueError, StopIteration, IndexError, TypeError, KeyError) as exc:
+            p.error(f"Cannot read BDD input paths from {args.dataset_from_plan}: {exc}")
 
     if args.resume_last:
         saved = _load_last_suite_descriptor()
@@ -152,8 +166,14 @@ def parse_args(argv=None):
                 args.sync_dir = Path(saved_args["sync_dir"])
         args.resume = True
 
+    data_root = ROOT / "data/bdd100k"
+    args.train_labels = args.train_labels or data_root / "raw/labels_train.json"
+    args.val_labels = args.val_labels or data_root / "raw/labels_val.json"
+    args.train_images = args.train_images or data_root / "images/train"
+    args.val_images = args.val_images or data_root / "images/val"
+
     # Apply preset-aware defaults (safe on Kaggle T4 16GB and portable to RTX 5090 / L40s)
-    is_q1 = args.preset in ("q1_pilot", "q1_paper")
+    is_q1 = args.preset in ("q1_pilot", "q1_a100", "q1_paper")
     if args.batch_size is None:
         args.batch_size = 2 if is_q1 else 1
     if args.grad_accum_steps is None:
@@ -165,7 +185,7 @@ def parse_args(argv=None):
     if args.lr_schedule is None:
         args.lr_schedule = "warmup_cosine" if is_q1 else "constant"
     if args.lr_warmup_steps is None:
-        args.lr_warmup_steps = 500 if args.preset == "q1_paper" else (150 if args.preset == "q1_pilot" else 0)
+        args.lr_warmup_steps = 500 if args.preset == "q1_paper" else (150 if is_q1 else 0)
 
     if args.output is None:
         args.output = _default_output_for_preset(args.preset)
@@ -241,7 +261,7 @@ def experiment_plan(preset, train_steps=None, warmup_steps=None, max_side=None):
             ("care_ssod", 0.7, "care_no_cutout", {"care_cutout": 0}),
         ]
         return specs, selected, warmup_steps or 1000, train_steps or 3000, max_side or 512
-    if preset == "q1_pilot":
+    if preset in ("q1_pilot", "q1_a100"):
         specs = ((0.10, 42),)
         selected = [
             ("supervised", 0.7, "supervised", {}),
@@ -250,6 +270,8 @@ def experiment_plan(preset, train_steps=None, warmup_steps=None, max_side=None):
             ("consistent_teacher", 0.7, "consistent_teacher", {}),
             ("core_ssod", 0.7, "core_ssod", {}),
         ]
+        if preset == "q1_a100":
+            return specs, selected, warmup_steps or 1500, train_steps or 3000, max_side or 800
         return specs, selected, warmup_steps or 500, train_steps or 1500, max_side or 800
     if preset == "q1_paper":
         specs = tuple((f, s) for f in PAPER_FRACTIONS for s in PAPER_SEEDS)
@@ -288,7 +310,7 @@ def _default_save_every(preset: str, override: int | None) -> int:
         return max(1, int(override))
     if preset in ("paper", "q1_paper"):
         return 250
-    if preset in ("core", "care", "q1_pilot"):
+    if preset in ("core", "care", "q1_pilot", "q1_a100"):
         return 200
     return 10
 
@@ -310,6 +332,9 @@ def generate_jobs(args):
         if args.preset in ("smoke", "pilot", "q1_pilot")
         else ("3000" if args.preset == "q1_paper" else "2000")
     )
+    if args.preset == "q1_a100":
+        eval_every = "1500"
+    reserve_calibration = any(variant == "core_ssod" for variant, *_ in variants)
     jobs = []
     for fraction, seed in specs:
         frac_tag = f"{round(100 * fraction):02d}pct"
@@ -332,6 +357,8 @@ def generate_jobs(args):
             "--eval-every", eval_every,
             "--amp", amp_arg,
         ]
+        if reserve_calibration:
+            base.append("--reserve-calibration")
         if args.preset == "smoke":
             base += ["--no-pretrained-backbone", "--eval-max-images", "4"]
         elif args.preset == "pilot":
@@ -551,6 +578,7 @@ def build_pipeline_dag(args, jobs: list[dict] | None = None) -> PipelineDAG:
             "lr_schedule": str(getattr(args, "lr_schedule", "constant")),
             "lr_warmup_steps": int(getattr(args, "lr_warmup_steps", 0)),
             "steps": int(job["steps"]),
+            "reserve_calibration": "--reserve-calibration" in job["command"],
             "pretrained_backbone": args.preset != "smoke",
             "kwargs": job.get("kwargs", {}),
         }
@@ -601,7 +629,7 @@ def build_pipeline_dag(args, jobs: list[dict] | None = None) -> PipelineDAG:
         order += 1
 
         # Per-class and condition-stratified evaluation stage for core & paper
-        if args.preset in ("core", "care", "q1_paper", "paper"):
+        if args.preset in ("core", "care", "q1_a100", "q1_paper", "paper"):
             an_name = f"{job['name']}/analysis"
             an_id = make_experiment_id(args.preset, an_name)
             analysis_ids.append(an_id)
@@ -742,10 +770,13 @@ def job_complete(job):
     if not status:
         return False
     saved = status.get("arguments", {})
+    if bool(saved.get("reserve_calibration")) != ("--reserve-calibration" in job["command"]):
+        raise RuntimeError(f"Calibration split policy changed for {out}. Use a new output path.")
     # Check only scientific hyperparameters (NOT machine-local paths or micro-batch split
     # so Kaggle 2x4 -> RTX 5090 4x2 transfers resume cleanly!).
     for flag in (
         "variant", "detector", "seed", "max_side", "pseudo_threshold",
+        "lr", "lr_schedule", "lr_warmup_steps",
         "box_weight", "class_weight", "confidence_weight",
         "localization_scale", "localization_enabled", "adaptive_strength",
         "condition_offset", "consistency_weight",
@@ -789,7 +820,7 @@ def _eval_complete(job) -> bool:
     has_row = any(int(r.get("step", -1)) == steps for r in rows)
     if not det.is_file() or not has_row:
         return False
-    if met is not None and met.get("complete") is not True:
+    if not met or met.get("complete") is not True:
         return False
     return True
 
@@ -867,7 +898,7 @@ def summarize(root):
 
 
 def analyze_final(job, args):
-    if job["type"] == "train" and args.preset in ("core", "care", "q1_paper", "paper"):
+    if job["type"] == "train" and args.preset in ("core", "care", "q1_a100", "q1_paper", "paper"):
         final_predictions = Path(job["output"]) / f"eval_{job['steps']:07d}" / "detections.json"
         if not final_predictions.is_file():
             raise RuntimeError(f"Missing final COCO detections: {final_predictions}")
@@ -1215,7 +1246,7 @@ def _run_reports_and_plots(args, registry: ExperimentRegistry, dag: PipelineDAG,
             runtime_delta_sec=time.monotonic() - t0,
         )
 
-    if args.preset in ("core", "care", "q1_paper", "paper"):
+    if args.preset in ("core", "care", "q1_a100", "q1_paper", "paper"):
         t1 = time.monotonic()
         from plot_results import render
         fig_dir = render(args.output)

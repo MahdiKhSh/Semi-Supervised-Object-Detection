@@ -156,8 +156,19 @@ def soft_teacher_unsupervised_loss(
     teacher_cache: dict[str, Any],
 ) -> tuple[torch.Tensor | None, dict[str, float]]:
     """Soft Teacher (ICCV 2021) unsupervised loss with soft-negative bg weighting."""
-    if not any(len(t["boxes"]) > 0 for t in aug_targets):
+    kept = [i for i, target in enumerate(aug_targets) if len(target["boxes"])]
+    if not kept:
         return None, {"unsup": 0.0, "stability": 0.0}
+
+    if len(kept) != len(aug_images):
+        aug_images = [aug_images[i] for i in kept]
+        aug_targets = [aug_targets[i] for i in kept]
+        flips = [flips[i] for i in kept]
+        reg_valid_list = [reg_valid_list[i] for i in kept]
+        teacher_cache = {
+            "features": {k: v[kept] for k, v in teacher_cache["features"].items()},
+            "transformed_sizes": [teacher_cache["transformed_sizes"][i] for i in kept],
+        }
 
     original_sizes = [(int(im.shape[-2]), int(im.shape[-1])) for im in aug_images]
     transformed, transformed_targets = model.transform(aug_images, aug_targets)
