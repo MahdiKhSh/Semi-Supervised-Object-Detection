@@ -359,6 +359,31 @@ def _teacher_detect_with_probs(teacher, images: list[torch.Tensor]):
 
 
 @torch.no_grad()
+def _photometric_restore_for_probe(image: torch.Tensor, vis: dict[str, float | str]) -> torch.Tensor:
+    """Label-free adaptive shadow/contrast restoration for degraded probing views.
+
+    Operates strictly on raw RGB statistics already computed by
+    ``estimate_visibility_degradation`` (zero external weather/time metadata).
+    Leaves clear daytime images untouched while lifting shadow detail on dark/night
+    scenes (without clipping bright traffic lights) and stretching washed-out fog/haze.
+    """
+    deg = float(vis.get("degradation", 0.0))
+    if deg < 0.20:
+        return image
+    out = image.detach().float().clamp(0.0, 1.0)
+    darkness = float(vis.get("darkness", 0.0))
+    if darkness > 0.05:
+        gamma = max(0.58, 1.0 - 0.42 * darkness)
+        out = out.clamp(min=1e-4).pow(gamma)
+    contrast_deficit = max(float(vis.get("low_contrast", 0.0)), float(vis.get("haze", 0.0)))
+    if contrast_deficit > 0.05:
+        c_gain = 1.0 + 0.28 * contrast_deficit
+        mean_rgb = out.mean(dim=(-2, -1), keepdim=True)
+        out = mean_rgb + c_gain * (out - mean_rgb)
+    return out.clamp(0.0, 1.0).to(dtype=image.dtype)
+
+
+@torch.no_grad()
 def teacher_bidirectional_probe(
     teacher,
     images: list[torch.Tensor],
@@ -368,21 +393,26 @@ def teacher_bidirectional_probe(
     nwd_constant: float = 12.8,
     loc_alpha: float = 0.35,
     cls_alpha: float = 0.20,
+    enable_photometric_probe: bool = True,
 ) -> tuple[list[dict[str, torch.Tensor]], dict[str, Any]]:
-    """Direct Bidirectional Cross-View Teacher Probing with Weighted Box Fusion.
+    """Direct Bidirectional Cross-View Teacher Probing with Photometric Dual-Discovery.
 
     1. Runs full teacher detection on original weak view -> FPN F1 and boxes b1.
-    2. Runs ONLY teacher backbone on horizontally flipped view -> FPN F2
-       (eliminates redundant second RPN + NMS and O(N^2) greedy matching!).
+    2. Computes label-free photometric degradation d(x); on degraded scenes, applies
+       adaptive gamma/contrast restoration to the horizontally flipped view before
+       computing teacher FPN F2, and runs lightweight RPN+RoI discovery on F2 for
+       degraded images (d(x) >= 0.28) to recover shadow/glare objects missed on F1.
     3. Probes F1 at b1 and F2 at flip(b1) via RoIAlign + box_head + box_predictor
-       to obtain paired cross-view probabilities (p1, p2) and refined box b2.
-    4. Computes weighted consensus box fusion b_bar, bidirectional score s_bar,
+       to obtain paired cross-view probabilities (p1, p2) and refined boxes.
+    4. Computes weighted consensus box fusion b_bar, visibility-adaptive score s_bar,
        vectorized O(N) NWD+IoU localization uncertainty u_loc, JS divergence u_cls,
        and calibrated reliability q = s_bar * exp(-loc_alpha*u_loc - cls_alpha*u_cls).
-    5. Returns cached F1 features for zero-cost ROI soft-negative background weighting.
+    5. Returns cached F1 features and per-image visibility dicts for zero-cost reuse.
     """
     teacher.eval()
     orig_sizes = [(int(im.shape[-2]), int(im.shape[-1])) for im in images]
+    vis_list = [estimate_visibility_degradation(im) for im in images]
+
     t1, _ = teacher.transform(images, None)
     f1 = teacher.backbone(t1.tensors)
     if isinstance(f1, torch.Tensor):
@@ -391,12 +421,76 @@ def teacher_bidirectional_probe(
     dets1, _ = teacher.roi_heads(f1, props1, t1.image_sizes, None)
     dets1 = teacher.transform.postprocess(dets1, t1.image_sizes, orig_sizes)
 
-    # Flipped view: backbone ONLY (no second RPN, no second NMS)
-    flipped_imgs = [torch.flip(im, dims=(-1,)) for im in images]
+    # Flipped view (+ zero-metadata photometric shadow/contrast lift on degraded scenes)
+    flipped_imgs = [
+        torch.flip(_photometric_restore_for_probe(im, vis) if enable_photometric_probe else im, dims=(-1,))
+        for im, vis in zip(images, vis_list)
+    ]
     t2, _ = teacher.transform(flipped_imgs, None)
     f2 = teacher.backbone(t2.tensors)
     if isinstance(f2, torch.Tensor):
         f2 = {"0": f2}
+
+    # Dual-discovery on degraded scenes (d(x) >= 0.28): reuse already-computed F2 to recover
+    # shadow/glare/haze objects missed by raw dark View 1 without an extra backbone pass!
+    from_view2_flags: list[torch.Tensor] = [
+        torch.zeros((len(d["boxes"]),), dtype=torch.bool, device=d["boxes"].device) for d in dets1
+    ]
+    deg_indices = (
+        [i for i, v in enumerate(vis_list) if float(v["degradation"]) >= 0.28]
+        if enable_photometric_probe
+        else []
+    )
+    if deg_indices:
+        from torchvision.models.detection.image_list import ImageList
+
+        sub_t2 = ImageList(
+            t2.tensors[deg_indices],
+            [t2.image_sizes[i] for i in deg_indices],
+        )
+        sub_f2 = {k: v[deg_indices] for k, v in f2.items()}
+        sub_props2, _ = teacher.rpn(sub_t2, sub_f2, None)
+        sub_dets2, _ = teacher.roi_heads(sub_f2, sub_props2, sub_t2.image_sizes, None)
+        sub_orig = [orig_sizes[i] for i in deg_indices]
+        sub_dets2 = teacher.transform.postprocess(sub_dets2, sub_t2.image_sizes, sub_orig)
+
+        for local_idx, img_idx in enumerate(deg_indices):
+            d2_item = sub_dets2[local_idx]
+            keep_score = d2_item["scores"] >= 0.30
+            if not bool(keep_score.any()):
+                continue
+            oh, ow = orig_sizes[img_idx]
+            cand_b2 = _flip_boxes_x(d2_item["boxes"][keep_score].float(), ow)
+            cand_l2 = d2_item["labels"][keep_score].long()
+            cand_s2 = d2_item["scores"][keep_score].float()
+
+            base_b1 = dets1[img_idx]["boxes"].float()
+            base_l1 = dets1[img_idx]["labels"].long()
+            if len(base_b1) > 0:
+                ious = box_iou(cand_b2, base_b1)
+                same_cls = cand_l2[:, None] == base_l1[None, :]
+                same_cls_iou = torch.where(same_cls, ious, torch.zeros_like(ious)).max(dim=1).values
+                any_cls_iou = ious.max(dim=1).values
+                novel_mask = (same_cls_iou < 0.50) & (any_cls_iou < 0.65)
+            else:
+                novel_mask = torch.ones((len(cand_b2),), dtype=torch.bool, device=cand_b2.device)
+
+            if bool(novel_mask.any()):
+                nb = cand_b2[novel_mask][:25]
+                nl = cand_l2[novel_mask][:25]
+                ns = cand_s2[novel_mask][:25]
+                dets1[img_idx] = {
+                    "boxes": torch.cat([base_b1, nb], dim=0),
+                    "labels": torch.cat([base_l1, nl], dim=0),
+                    "scores": torch.cat([dets1[img_idx]["scores"].float(), ns], dim=0),
+                }
+                from_view2_flags[img_idx] = torch.cat(
+                    [
+                        from_view2_flags[img_idx],
+                        torch.ones((len(nb),), dtype=torch.bool, device=nb.device),
+                    ],
+                    dim=0,
+                )
 
     boxes_t1: list[torch.Tensor] = []
     boxes_t2: list[torch.Tensor] = []
@@ -422,8 +516,9 @@ def teacher_bidirectional_probe(
     if sum(counts) > 0:
         rf1 = teacher.roi_heads.box_roi_pool(f1, boxes_t1, t1.image_sizes)
         rf1 = teacher.roi_heads.box_head(rf1)
-        logits1, _ = teacher.roi_heads.box_predictor(rf1)
+        logits1, reg1 = teacher.roi_heads.box_predictor(rf1)
         probs1_all = F.softmax(logits1.float(), dim=-1)
+        dec1_all = teacher.roi_heads.box_coder.decode(reg1.float(), boxes_t1)
 
         rf2 = teacher.roi_heads.box_roi_pool(f2, boxes_t2, t2.image_sizes)
         rf2 = teacher.roi_heads.box_head(rf2)
@@ -432,34 +527,50 @@ def teacher_bidirectional_probe(
         dec2_all = teacher.roi_heads.box_coder.decode(reg2.float(), boxes_t2)
 
         split_p1 = list(probs1_all.split(counts, dim=0))
+        split_d1 = list(dec1_all.split(counts, dim=0))
         split_p2 = list(probs2_all.split(counts, dim=0))
         split_d2 = list(dec2_all.split(counts, dim=0))
     else:
         split_p1 = [d["boxes"].new_zeros((0, num_cls)) for d in dets1]
+        split_d1 = [d["boxes"].new_zeros((0, num_cls, 4)) for d in dets1]
         split_p2 = [d["boxes"].new_zeros((0, num_cls)) for d in dets1]
         split_d2 = [d["boxes"].new_zeros((0, num_cls, 4)) for d in dets1]
 
     probed: list[dict[str, torch.Tensor]] = []
-    for det, p1, p2, d2, (oh, ow), (th2, tw2) in zip(
-        dets1, split_p1, split_p2, split_d2, orig_sizes, t2.image_sizes
+    for det, from_v2, vis, p1, d1, p2, d2, (oh, ow), (th1, tw1), (th2, tw2) in zip(
+        dets1, from_view2_flags, vis_list, split_p1, split_d1, split_p2, split_d2,
+        orig_sizes, t1.image_sizes, t2.image_sizes,
     ):
-        b1 = det["boxes"].float()
+        b_seed = det["boxes"].float()
         labels = det["labels"].long()
-        s1 = det["scores"].float()
-        if len(b1):
+        s_raw = det["scores"].float()
+        if len(b_seed):
             rows = torch.arange(len(labels), device=labels.device)
+            max_x1 = max(0.0, float(ow) - 1.0)
+            max_y1 = max(0.0, float(oh) - 1.0)
+
+            # View-1 box: original NMS box for View-1 seeds, RoI-decoded View-1 box for View-2 seeds
+            b1_dec = d1[rows, labels].clone()
+            b1_dec[:, [0, 2]] = (b1_dec[:, [0, 2]] * (float(ow) / max(1, tw1))).clamp(0.0, float(ow))
+            b1_dec[:, [1, 3]] = (b1_dec[:, [1, 3]] * (float(oh) / max(1, th1))).clamp(0.0, float(oh))
+            b1_dec[:, 0] = b1_dec[:, 0].clamp(0.0, max_x1)
+            b1_dec[:, 1] = b1_dec[:, 1].clamp(0.0, max_y1)
+            b1_dec[:, 2] = torch.maximum(b1_dec[:, 2].clamp(0.0, float(ow)), (b1_dec[:, 0] + 1.0).clamp(max=float(ow)))
+            b1_dec[:, 3] = torch.maximum(b1_dec[:, 3].clamp(0.0, float(oh)), (b1_dec[:, 1] + 1.0).clamp(max=float(oh)))
+            b1 = torch.where(from_v2[:, None], b1_dec, b_seed)
+
             b2 = d2[rows, labels].clone()
             b2[:, [0, 2]] = (b2[:, [0, 2]] * (float(ow) / max(1, tw2))).clamp(0.0, float(ow))
             b2[:, [1, 3]] = (b2[:, [1, 3]] * (float(oh) / max(1, th2))).clamp(0.0, float(oh))
             b2 = _flip_boxes_x(b2, ow)
             # Ensure well-ordered non-degenerate boxes strictly inside [0, ow] x [0, oh]
-            max_x1 = max(0.0, float(ow) - 1.0)
-            max_y1 = max(0.0, float(oh) - 1.0)
             b2[:, 0] = b2[:, 0].clamp(0.0, max_x1)
             b2[:, 1] = b2[:, 1].clamp(0.0, max_y1)
             b2[:, 2] = torch.maximum(b2[:, 2].clamp(0.0, float(ow)), (b2[:, 0] + 1.0).clamp(max=float(ow)))
             b2[:, 3] = torch.maximum(b2[:, 3].clamp(0.0, float(oh)), (b2[:, 1] + 1.0).clamp(max=float(oh)))
 
+            p1_cls = p1[rows, labels].clamp(0.0, 1.0)
+            s1 = torch.where(from_v2, p1_cls, s_raw)
             s2_rep = p2[rows, labels].clamp(0.0, 1.0)
             iou_vec = elementwise_iou(b1, b2)
             if use_nwd:
@@ -483,16 +594,23 @@ def teacher_bidirectional_probe(
                 fused_boxes[:, 3].clamp(0.0, float(oh)), (fused_boxes[:, 1] + 1.0).clamp(max=float(oh))
             )
 
-            consensus_score = 0.5 * (s1 + s2_rep)
-            reliability = (consensus_score * torch.exp(-float(loc_alpha) * u_loc - float(cls_alpha) * u_cls)).clamp(0.0, 1.0)
-            probs_avg = (0.5 * (p1 + p2)).clamp(min=1e-7)
+            deg_val = float(vis.get("degradation", 0.0))
+            w_v2 = (0.50 + 0.18 * deg_val) if (enable_photometric_probe and deg_val >= 0.20) else 0.50
+            w_v1 = 1.0 - w_v2
+            consensus_score = w_v1 * s1 + w_v2 * s2_rep
+            # Attenuate cross-view JS penalty mildly when View 2 was photometrically lifted on dark scenes
+            eff_cls_alpha = float(cls_alpha) * (1.0 - 0.35 * deg_val if (enable_photometric_probe and deg_val >= 0.20) else 1.0)
+            reliability = (consensus_score * torch.exp(-float(loc_alpha) * u_loc - eff_cls_alpha * u_cls)).clamp(0.0, 1.0)
+            probs_avg = (w_v1 * p1 + w_v2 * p2).clamp(min=1e-7)
             probs_avg = probs_avg / probs_avg.sum(dim=-1, keepdim=True)
         else:
-            fused_boxes = b1.clone()
-            consensus_score = s1.clone()
-            reliability = s1.clone()
-            u_loc = s1.clone()
-            u_cls = s1.clone()
+            b1 = b_seed
+            s1 = s_raw
+            fused_boxes = b_seed.clone()
+            consensus_score = s_raw.clone()
+            reliability = s_raw.clone()
+            u_loc = s_raw.clone()
+            u_cls = s_raw.clone()
             probs_avg = p1.clone()
 
         probed.append({
@@ -512,6 +630,7 @@ def teacher_bidirectional_probe(
         "features": {k: v.detach() for k, v in f1.items()},
         "transformed_sizes": list(t1.image_sizes),
         "original_sizes": orig_sizes,
+        "visibilities": vis_list,
     }
     return probed, teacher_cache
 
@@ -540,6 +659,7 @@ def extract_teacher_tri_zone_targets(
         nwd_constant=nwd_constant,
         loc_alpha=loc_alpha,
         cls_alpha=cls_alpha,
+        enable_photometric_probe=use_visibility_calibration,
     )
 
     outputs: list[dict[str, Any]] = []
@@ -552,9 +672,9 @@ def extract_teacher_tri_zone_targets(
         "degradation_mean": 0.0,
     }
     deg_scores = []
+    cached_vis = teacher_cache.get("visibilities") or [estimate_visibility_degradation(im) for im in images]
 
-    for image, item in zip(images, probed):
-        vis = estimate_visibility_degradation(image)
+    for vis, item in zip(cached_vis, probed):
         regime = str(vis["regime"])
         deg_scores.append(float(vis["degradation"]))
         if hasattr(calibrator, "observe_unlabeled_visibility"):
@@ -861,10 +981,13 @@ def care_unsupervised_loss(
     teacher=None,
     teacher_cache: dict[str, Any] | None = None,
     flips: list[bool] | None = None,
+    class_counts: dict[int, int] | None = None,
     use_tri_zone: bool = True,
     giou_weight: float = 0.25,
     kl_zone1_weight: float = 0.15,
-    kl_zone2_weight: float = 0.05,
+    kl_zone2_weight: float = 0.12,
+    z2_reg_weight: float = 0.50,
+    z2_reg_loc_thresh: float = 0.72,
     temperature: float = 1.5,
     reg_loc_thresh: float = 0.55,
     scale_by_batch_size: bool = True,
@@ -879,9 +1002,11 @@ def care_unsupervised_loss(
        proposals by teacher background probability ``p_T(bg)`` attenuated by
        ``(1 - p_tp(z2))`` for Zone-2 overlaps, normalized to mean 1.0 (preserves
        background calibration and eliminates false-positive spam!).
-    3. **Task-Decoupled Foreground Supervision**: reliability-weighted ROI CE +
-       localization-gated Smooth-L1 & sampled-proposal GIoU regression (only on
-       geometrically stable Zone-1 boxes with ``q_loc >= reg_loc_thresh``).
+    3. **Task-Decoupled Foreground Supervision**: reliability- and tail-frequency-weighted
+       ROI CE + localization-gated Smooth-L1 & sampled-proposal GIoU regression on
+       geometrically stable Zone-1 boxes, plus decoupled localization regression on
+       high-stability Zone-2 boxes (``q_loc >= z2_reg_loc_thresh``) without forcing
+       hard Zone-2 class labels.
     4. **Calibrated Full-Distribution KL Distillation**: mild soft distillation on
        Zone-1 and Zone-2 boxes using bidirectional consensus probabilities (including
        background mass).
@@ -892,6 +1017,16 @@ def care_unsupervised_loss(
         return None, {"unsup": 0.0, "stability": 0.0, "suppressed_bg": 0}
 
     total_batch_size = max(1, len(aug_images))
+    num_cls_total = int(model.roi_heads.box_predictor.cls_score.out_features)
+    cls_bal_lut: torch.Tensor | None = None
+    if class_counts:
+        positive_counts = {int(k): int(v) for k, v in class_counts.items() if int(v) > 0}
+        if positive_counts:
+            max_cnt = float(max(positive_counts.values()))
+            cls_bal_lut = torch.ones((num_cls_total,), dtype=torch.float32, device=aug_images[0].device)
+            for cid, cnt in positive_counts.items():
+                if 0 < cid < num_cls_total:
+                    cls_bal_lut[cid] = min(1.60, max(1.0, (max_cnt / max(10.0, float(cnt))) ** 0.15))
 
     original_sizes = [(int(im.shape[-2]), int(im.shape[-1])) for im in aug_images]
     transformed, transformed_targets = model.transform(aug_images, zone1_targets if has_z1 else None)
@@ -902,11 +1037,15 @@ def care_unsupervised_loss(
     ambig_trans = _scale_boxes_to_transformed(
         [z["boxes"] for z in zone2_meta], original_sizes, transformed.image_sizes
     )
+    z1_boxes_trans = _scale_boxes_to_transformed(
+        [z["boxes"] for z in zone1_meta], original_sizes, transformed.image_sizes
+    )
 
     total = None
     det_loss_val = 0.0
     stab_loss_val = 0.0
     suppressed_bg = 0
+    cached_rpn_proposals: dict[int, torch.Tensor] = {}
 
     # 1. Zone-1 RPN + Conformal Soft-Negative ROI loss ONLY on images with >= 1 Zone-1 box
     #    (An unlabeled image with 0 Zone-1 pseudo-boxes is unknown foreground — e.g. dark night —
@@ -958,6 +1097,8 @@ def care_unsupervised_loss(
             suppressed_bg += ignored_rpn
         else:
             proposals, rpn_losses = model.rpn(det_images, det_features, det_targets)
+        for p_slot, img_idx in enumerate(positive):
+            cached_rpn_proposals[img_idx] = proposals[p_slot].detach()
 
         sampled_props, matched_idxs, labels_list, reg_targets_list = model.roi_heads.select_training_samples(
             proposals, det_targets
@@ -974,7 +1115,7 @@ def care_unsupervised_loss(
         # Compute Conformal Soft-Negative weights for background ROI proposals
         cls_weights = torch.ones(len(labels), dtype=torch.float32, device=labels.device)
 
-        # (a) Foreground reliability weights from matched Zone-1 boxes
+        # (a) Foreground reliability (+ mild tail-class balance) weights from matched Zone-1 boxes
         fg_rel_per_prop = []
         fg_qloc_per_prop = []
         for m_idx, z1_m in zip(matched_idxs, det_z1_meta):
@@ -993,8 +1134,10 @@ def care_unsupervised_loss(
         fg_rel_all = torch.cat(fg_rel_per_prop, dim=0)
         fg_qloc_all = torch.cat(fg_qloc_per_prop, dim=0)
         if bool(fg_mask.any()):
-            # Smooth reliability weight in [0.5, 1.0] for Zone-1 positives
-            cls_weights[fg_mask] = (0.5 + 0.5 * fg_rel_all[fg_mask].clamp(0.0, 1.0)).detach()
+            fg_w = 0.5 + 0.5 * fg_rel_all[fg_mask].clamp(0.0, 1.0)
+            if cls_bal_lut is not None:
+                fg_w = fg_w * cls_bal_lut[labels[fg_mask].clamp(0, num_cls_total - 1)]
+            cls_weights[fg_mask] = fg_w.detach()
 
         # (b) Background soft weights: teacher p_T(bg) * (1 - p_tp(z2 overlap)), normalized to mean 1.0
         if bool(bg_mask.any()):
@@ -1063,6 +1206,8 @@ def care_unsupervised_loss(
             pred_deltas = box_reg[sampled_pos_inds, labels_pos].float()
             tgt_deltas = regression_targets[sampled_pos_inds].float()
             q_w = fg_qloc_all[sampled_pos_inds].detach().clamp(0.1, 1.0)
+            if cls_bal_lut is not None:
+                q_w = (q_w * cls_bal_lut[labels_pos.clamp(0, num_cls_total - 1)]).detach()
             per_box_l1 = F.smooth_l1_loss(pred_deltas, tgt_deltas, beta=1.0 / 9.0, reduction="none").sum(dim=1)
             loss_box = (per_box_l1 * q_w).sum() / max(1.0, float(labels.numel()))
 
@@ -1094,10 +1239,140 @@ def care_unsupervised_loss(
         det_loss_val = float(det_total.detach())
         stab_loss_val += float(scaled_giou.detach())
 
-    # 2. Mild calibrated full-distribution KL distillation on Zone 1 (reusing student FPN)
-    z1_boxes_trans = _scale_boxes_to_transformed(
-        [z["boxes"] for z in zone1_meta], original_sizes, transformed.image_sizes
-    )
+    # 2. Decoupled Zone-2 High-Stability Localization Regression (without hard class forcing!)
+    #    Zone-2 boxes with strong cross-view geometric consensus (q_loc >= z2_reg_loc_thresh) and
+    #    calibrated PAVA precision (p_tp >= 0.35) supervise student box regression on matching RPN proposals.
+    if use_tri_zone and float(z2_reg_weight) > 0.0:
+        z2_stable_entries: list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        for img_idx, (z2_b, z2_m) in enumerate(zip(ambig_trans, zone2_meta)):
+            qloc_t = z2_m.get("q_loc")
+            lbl_t = z2_m.get("labels")
+            if len(z2_b) == 0 or qloc_t is None or lbl_t is None or len(qloc_t) != len(z2_b):
+                continue
+            ptp_t = z2_m.get("p_tp", z2_m.get("reliability", qloc_t))
+            qloc_dev = qloc_t.to(z2_b.device).float()
+            ptp_dev = ptp_t.to(z2_b.device).float()
+            lbl_dev = lbl_t.to(z2_b.device).long()
+            stable_mask = (
+                (qloc_dev >= float(z2_reg_loc_thresh))
+                & (ptp_dev >= 0.35)
+                & (lbl_dev >= 1)
+                & (lbl_dev < num_cls_total)
+            )
+            if bool(stable_mask.any()):
+                w_st = (ptp_dev[stable_mask] * qloc_dev[stable_mask]).clamp(0.10, 1.0)
+                if cls_bal_lut is not None:
+                    w_st = w_st * cls_bal_lut[lbl_dev[stable_mask]]
+                z2_stable_entries.append(
+                    (img_idx, z2_b[stable_mask].detach(), lbl_dev[stable_mask].detach(), w_st.detach())
+                )
+
+        if z2_stable_entries:
+            missing_rpn_ids = [idx for idx, *_ in z2_stable_entries if idx not in cached_rpn_proposals]
+            if missing_rpn_ids:
+                from torchvision.models.detection.image_list import ImageList
+                from ssod_research.baselines import extract_rpn_proposals_only
+
+                extra_imgs = ImageList(
+                    transformed.tensors[missing_rpn_ids],
+                    [transformed.image_sizes[idx] for idx in missing_rpn_ids],
+                )
+                extra_feats = {k: v[missing_rpn_ids] for k, v in features.items()}
+                extra_props = extract_rpn_proposals_only(model.rpn, extra_imgs, extra_feats)
+                for p_slot, idx in enumerate(missing_rpn_ids):
+                    cached_rpn_proposals[idx] = extra_props[p_slot].detach()
+
+            z2_props_per_img: list[torch.Tensor] = []
+            z2_tgt_boxes_list: list[torch.Tensor] = []
+            z2_tgt_lbls_list: list[torch.Tensor] = []
+            z2_tgt_w_list: list[torch.Tensor] = []
+            active_z2_reg_imgs = 0
+            for idx in range(len(aug_images)):
+                z2_props_per_img.append(transformed.tensors.new_zeros((0, 4)))
+            for img_idx, st_boxes, st_lbls, st_w in z2_stable_entries:
+                z1_b = z1_boxes_trans[img_idx]
+                if len(z1_b) > 0:
+                    non_z1 = box_iou(st_boxes, z1_b).max(dim=1).values < 0.50
+                    st_boxes = st_boxes[non_z1]
+                    st_lbls = st_lbls[non_z1]
+                    st_w = st_w[non_z1]
+                if len(st_boxes) == 0:
+                    continue
+
+                th_i, tw_i = transformed.image_sizes[img_idx]
+                bw = (st_boxes[:, 2] - st_boxes[:, 0]).clamp(min=2.0)
+                bh = (st_boxes[:, 3] - st_boxes[:, 1]).clamp(min=2.0)
+                # Deterministic +-8% spatial jitter proposals guarantee non-zero regression deltas
+                # even for tiny 8x12 traffic lights or night objects not yet proposed by student RPN
+                jit_a = torch.stack([
+                    (st_boxes[:, 0] - 0.08 * bw).clamp(0.0, max(0.0, float(tw_i) - 1.0)),
+                    (st_boxes[:, 1] - 0.08 * bh).clamp(0.0, max(0.0, float(th_i) - 1.0)),
+                    (st_boxes[:, 2] - 0.04 * bw).clamp(1.0, float(tw_i)),
+                    (st_boxes[:, 3] - 0.04 * bh).clamp(1.0, float(th_i)),
+                ], dim=1)
+                jit_b = torch.stack([
+                    (st_boxes[:, 0] + 0.04 * bw).clamp(0.0, max(0.0, float(tw_i) - 1.0)),
+                    (st_boxes[:, 1] + 0.04 * bh).clamp(0.0, max(0.0, float(th_i) - 1.0)),
+                    (st_boxes[:, 2] + 0.08 * bw).clamp(1.0, float(tw_i)),
+                    (st_boxes[:, 3] + 0.08 * bh).clamp(1.0, float(th_i)),
+                ], dim=1)
+                jit_a[:, 2] = torch.maximum(jit_a[:, 2], (jit_a[:, 0] + 1.0).clamp(max=float(tw_i)))
+                jit_a[:, 3] = torch.maximum(jit_a[:, 3], (jit_a[:, 1] + 1.0).clamp(max=float(th_i)))
+                jit_b[:, 2] = torch.maximum(jit_b[:, 2], (jit_b[:, 0] + 1.0).clamp(max=float(tw_i)))
+                jit_b[:, 3] = torch.maximum(jit_b[:, 3], (jit_b[:, 1] + 1.0).clamp(max=float(th_i)))
+                seed_props = torch.cat([jit_a, jit_b], dim=0)
+
+                cand_p = cached_rpn_proposals.get(img_idx)
+                if cand_p is not None and len(cand_p) > 0:
+                    if len(z1_b) > 0:
+                        cand_p = cand_p[box_iou(cand_p, z1_b).max(dim=1).values < 0.50]
+                    cand_all = torch.cat([seed_props, cand_p], dim=0)
+                else:
+                    cand_all = seed_props
+
+                ious_st = box_iou(cand_all, st_boxes)
+                max_iou_st, best_st = ious_st.max(dim=1)
+                pos_m = max_iou_st >= 0.50
+                if not bool(pos_m.any()):
+                    continue
+                sel_inds = torch.where(pos_m)[0]
+                if len(sel_inds) > 64:
+                    top_order = torch.argsort(max_iou_st[sel_inds], descending=True)[:64]
+                    sel_inds = sel_inds[top_order]
+                m_props = cand_all[sel_inds].detach()
+                m_best = best_st[sel_inds]
+                z2_props_per_img[img_idx] = m_props
+                z2_tgt_boxes_list.append(st_boxes[m_best])
+                z2_tgt_lbls_list.append(st_lbls[m_best])
+                z2_tgt_w_list.append(st_w[m_best])
+                active_z2_reg_imgs += 1
+
+            if active_z2_reg_imgs > 0:
+                z2_rf = model.roi_heads.box_roi_pool(features, z2_props_per_img, transformed.image_sizes)
+                z2_rf = model.roi_heads.box_head(z2_rf)
+                _, z2_box_reg = model.roi_heads.box_predictor(z2_rf)
+                n_z2_p = z2_box_reg.shape[0]
+                z2_box_reg = z2_box_reg.reshape(n_z2_p, num_cls_total, 4)
+                cat_props = torch.cat([p for p in z2_props_per_img if len(p) > 0], dim=0).float()
+                cat_boxes = torch.cat(z2_tgt_boxes_list, dim=0).float()
+                cat_lbls = torch.cat(z2_tgt_lbls_list, dim=0).long()
+                cat_w = torch.cat(z2_tgt_w_list, dim=0).float()
+                rows_z2 = torch.arange(n_z2_p, device=z2_box_reg.device)
+                pred_z2_deltas = z2_box_reg[rows_z2, cat_lbls].float()
+                tgt_z2_deltas = model.roi_heads.box_coder.encode_single(cat_boxes, cat_props).float()
+                l1_z2 = F.smooth_l1_loss(pred_z2_deltas, tgt_z2_deltas, beta=1.0 / 9.0, reduction="none").sum(dim=1)
+                loss_z2_l1 = (l1_z2 * cat_w).sum() / max(64.0, float(n_z2_p))
+                if giou_weight > 0.0:
+                    dec_z2 = model.roi_heads.box_coder.decode_single(pred_z2_deltas, cat_props)
+                    loss_z2_giou = float(giou_weight) * _giou_consistency_loss(dec_z2, cat_boxes, cat_w)
+                else:
+                    loss_z2_giou = loss_z2_l1 * 0.0
+                z2_reg_scale = (float(active_z2_reg_imgs) / float(total_batch_size)) if scale_by_batch_size else 1.0
+                loss_z2_reg = z2_reg_scale * float(z2_reg_weight) * (loss_z2_l1 + loss_z2_giou)
+                total = loss_z2_reg if total is None else (total + loss_z2_reg)
+                stab_loss_val += float(loss_z2_reg.detach())
+
+    # 3. Mild calibrated full-distribution KL distillation on Zone 1 (reusing student FPN)
     n_z1_imgs = sum(1 for b in z1_boxes_trans if len(b) > 0)
     if kl_zone1_weight > 0.0 and n_z1_imgs > 0:
         roi_f1 = model.roi_heads.box_roi_pool(features, z1_boxes_trans, transformed.image_sizes)
@@ -1110,7 +1385,7 @@ def care_unsupervised_loss(
         total = loss_kl1 if total is None else (total + loss_kl1)
         stab_loss_val += float(loss_kl1.detach())
 
-    # 3. Mild calibrated full-distribution KL distillation on Zone 2 (includes background mass)
+    # 4. Mild calibrated full-distribution KL distillation on Zone 2 (includes background mass)
     n_z2_imgs = sum(1 for b in ambig_trans if len(b) > 0)
     if use_tri_zone and kl_zone2_weight > 0.0 and n_z2_imgs > 0:
         roi_f2 = model.roi_heads.box_roi_pool(features, ambig_trans, transformed.image_sizes)

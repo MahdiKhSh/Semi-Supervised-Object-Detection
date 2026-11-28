@@ -12,6 +12,7 @@ import argparse
 import contextlib
 import csv
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -93,11 +94,12 @@ def parse_args(argv=None):
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--grad-accum-steps", type=int, default=None)
     p.add_argument("--detector", choices=("fasterrcnn_v1", "fasterrcnn_v2"), default=None)
-    p.add_argument("--anchor-profile", choices=("default", "road_small"), default="default")
+    p.add_argument("--anchor-profile", choices=("default", "road_small"), default=None,
+                   help="RPN anchor design (default: 'road_small' for Q1 presets, 'default' for legacy presets).")
     p.add_argument("--reserve-calibration", action=argparse.BooleanOptionalAction, default=None,
                    help="Override calibration-fold reservation policy (default: True when core_ssod is in suite).")
-    p.add_argument("--stratify-calibration", action="store_true",
-                   help="Stratify calibration fold by weather/time-of-day and rare-class presence.")
+    p.add_argument("--stratify-calibration", action=argparse.BooleanOptionalAction, default=None,
+                   help="Stratify calibration fold by weather/time-of-day and rare-class presence (default: True for Q1).")
     p.add_argument("--zero-box-filter", type=int, choices=(0, 1), default=None,
                    help="Override zero-pseudo-box image filtering (1=exclude from hard RPN/ROI, 0=legacy).")
     p.add_argument("--eval-max-images", type=int, default=None,
@@ -169,9 +171,9 @@ def parse_args(argv=None):
                 if getattr(args, key) is None and saved_args.get(key):
                     setattr(args, key, Path(saved_args[key]))
             for key in (
-                "device", "amp", "batch_size", "grad_accum_steps", "detector",
-                "lr", "lr_schedule", "lr_warmup_steps", "ema", "unsup_warmup_steps",
-                "warmup_steps", "train_steps", "max_side", "save_every",
+                "device", "amp", "batch_size", "grad_accum_steps", "detector", "anchor_profile",
+                "stratify_calibration", "lr", "lr_schedule", "lr_warmup_steps", "ema",
+                "unsup_warmup_steps", "warmup_steps", "train_steps", "max_side", "save_every",
             ):
                 if saved_args.get(key) is not None and getattr(args, key) in (None, "auto"):
                     setattr(args, key, saved_args[key])
@@ -193,8 +195,13 @@ def parse_args(argv=None):
         args.grad_accum_steps = 4 if is_q1 else 1  # effective batch = 8 for q1 presets!
     if args.detector is None:
         args.detector = "fasterrcnn_v2" if is_q1 else "fasterrcnn_v1"
+    if args.anchor_profile is None:
+        args.anchor_profile = "road_small" if is_q1 else "default"
+    if args.stratify_calibration is None:
+        args.stratify_calibration = bool(is_q1)
     if args.lr is None:
-        args.lr = 0.01 if is_q1 else 0.003
+        eff_bs = max(1, int(args.batch_size) * int(args.grad_accum_steps))
+        args.lr = round(0.01 * math.sqrt(eff_bs / 8.0), 4) if is_q1 else 0.003
     if args.lr_schedule is None:
         args.lr_schedule = "warmup_cosine" if is_q1 else "constant"
     if args.lr_warmup_steps is None:
@@ -390,8 +397,8 @@ def generate_jobs(args):
             common += ["--anchor-profile", str(args.anchor_profile)]
         if reserve_calibration:
             common.append("--reserve-calibration")
-        if getattr(args, "stratify_calibration", False):
-            common.append("--stratify-calibration")
+            if getattr(args, "stratify_calibration", False):
+                common.append("--stratify-calibration")
         if getattr(args, "zero_box_filter", None) is not None:
             common += ["--zero-box-filter", str(int(args.zero_box_filter))]
         eval_max_override = getattr(args, "eval_max_images", None)

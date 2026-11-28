@@ -818,7 +818,7 @@ def parse_args(argv=None):
     p.add_argument("--care-cutout", type=int, choices=(0, 1), default=1)
     p.add_argument("--care-giou-weight", type=float, default=0.25)
     p.add_argument("--care-kl-z1-weight", type=float, default=0.15)
-    p.add_argument("--care-kl-z2-weight", type=float, default=0.05)
+    p.add_argument("--care-kl-z2-weight", type=float, default=0.12)
     p.add_argument("--care-temperature", type=float, default=1.5)
     p.add_argument("--conformal-alpha-strict", type=float, default=0.10)
     p.add_argument("--conformal-alpha-loose", type=float, default=0.30)
@@ -1016,6 +1016,7 @@ def _train_locked(args, out: Path):
             alpha_strict=float(args.conformal_alpha_strict),
             alpha_loose=float(args.conformal_alpha_loose),
             use_visibility_weighting=bool(args.conformal_vis_weight),
+            class_counts=counts,
         )
         if args.variant == "core_ssod"
         else None
@@ -1505,6 +1506,7 @@ def _train_locked(args, out: Path):
                                 teacher=teacher,
                                 teacher_cache=t_cache,
                                 flips=flips,
+                                class_counts=counts,
                                 use_tri_zone=bool(args.care_tri_zone),
                                 giou_weight=float(args.care_giou_weight),
                                 kl_zone1_weight=float(args.care_kl_z1_weight),

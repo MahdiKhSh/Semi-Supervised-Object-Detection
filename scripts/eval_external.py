@@ -40,8 +40,15 @@ def main(argv=None):
         else "cpu" if args.device == "auto" else args.device
     )
     state = safe_torch_load(args.checkpoint)
-    detector_type = (state.get("config") or {}).get("detector", "fasterrcnn_v1")
-    model = build_model(pretrained_backbone=False, max_side=args.max_side, detector=detector_type).to(device)
+    cfg = state.get("config") or {}
+    detector_type = cfg.get("detector", "fasterrcnn_v1")
+    anchor_profile = cfg.get("anchor_profile", "default")
+    model = build_model(
+        pretrained_backbone=False,
+        max_side=args.max_side,
+        detector=detector_type,
+        anchor_profile=anchor_profile,
+    ).to(device)
     selected = args.weights
     if selected == "auto":
         selected = "teacher" if state.get("teacher") is not None else "student"
@@ -65,6 +72,7 @@ def main(argv=None):
         "checkpoint": str(args.checkpoint),
         "weights": selected,
         "detector": detector_type,
+        "anchor_profile": anchor_profile,
         "dataset": str(args.coco_ann),
         "max_side": int(args.max_side),
         "metrics": metrics,

@@ -429,3 +429,99 @@ def test_cuda_bf16_mixed_batch_core_ssod_and_soft_teacher():
         )
         assert loss_st is not None and torch.isfinite(loss_st).item()
     loss_st.backward()
+
+
+# ------------------------------------------------------------------ 8. Photometric Dual-Discovery, Tail Shrinkage & Zone-2 Reg
+def test_photometric_dual_discovery_tail_conformal_shrinkage_and_zone2_regression():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("torchvision")
+    from run_suite import generate_jobs, parse_args as suite_parse
+    from ssod_research.care_ssod import (
+        _photometric_restore_for_probe,
+        care_unsupervised_loss,
+        estimate_visibility_degradation,
+        teacher_bidirectional_probe,
+    )
+    from ssod_research.conformal import WeightedConformalRiskCalibrator
+    from ssod_research.native_training import build_model, target_for_training
+
+    # (a) Photometric probe is exact identity on clear daytime and lifts dark shadow scenes in [0, 1]
+    day = torch.zeros(3, 96, 128)
+    day[:, :48, :] = 0.82
+    day[:, 48:, :] = 0.28
+    vis_day = estimate_visibility_degradation(day)
+    assert vis_day["regime"] == "clear"
+    assert torch.equal(_photometric_restore_for_probe(day, vis_day), day)
+
+    night = torch.full((3, 96, 128), 0.05)
+    night[:, 20:28, 30:38] = 0.98  # bright traffic light / headlight
+    vis_night = estimate_visibility_degradation(night)
+    assert vis_night["regime"] == "degraded"
+    lifted = _photometric_restore_for_probe(night, vis_night)
+    assert float(lifted.mean()) > 2.2 * float(night.mean())
+    assert float(lifted.min()) >= 0.0 and float(lifted.max()) <= 1.0
+
+    teacher = build_model(pretrained_backbone=False, max_side=160, detector="fasterrcnn_v2", anchor_profile="road_small")
+    teacher.eval()
+    probed, t_cache = teacher_bidirectional_probe(teacher, [day, night], enable_photometric_probe=True)
+    assert len(probed) == 2 and len(t_cache["visibilities"]) == 2
+    assert t_cache["visibilities"][1]["regime"] == "degraded"
+
+    # (b) Tail-aware conformal shrinkage lowers rare-class prior relative to car & round-trips state_dict
+    counts = {3: 70000, 1: 9000, 2: 400, 6: 18}
+    cal = WeightedConformalRiskCalibrator(num_foreground_classes=10, class_counts=counts)
+    tau_car, _ = cal.thresholds(3, "degraded")
+    tau_rider, _ = cal.thresholds(2, "degraded")
+    tau_train, _ = cal.thresholds(6, "degraded")
+    assert tau_train < tau_rider < tau_car
+    st = cal.state_dict()
+    cal2 = WeightedConformalRiskCalibrator(num_foreground_classes=10)
+    cal2.load_state_dict(st)
+    assert cal2.state_dict() == st
+
+    # (c) Decoupled Zone-2 high-stability box regression backpropagates through bbox_pred even with 0 Zone-1 boxes
+    student = build_model(pretrained_backbone=False, max_side=256, detector="fasterrcnn_v2", anchor_profile="road_small")
+    student.train()
+    img = torch.rand(3, 192, 256)
+    empty_z1 = {
+        "boxes": torch.zeros((0, 4)),
+        "labels": torch.zeros((0,), dtype=torch.long),
+        "scores": torch.zeros((0,)),
+        "probs": torch.zeros((0, 11)),
+        "reliability": torch.zeros((0,)),
+        "q_loc": torch.zeros((0,)),
+        "p_tp": torch.zeros((0,)),
+    }
+    probs_z2 = torch.full((1, 11), 0.02)
+    probs_z2[0, 2] = 0.80
+    z2_stable = {
+        "boxes": torch.tensor([[24.0, 24.0, 210.0, 160.0]]),
+        "labels": torch.tensor([2], dtype=torch.long),
+        "scores": torch.tensor([0.58]),
+        "probs": probs_z2,
+        "reliability": torch.tensor([0.52]),
+        "q_loc": torch.tensor([0.86]),
+        "p_tp": torch.tensor([0.55]),
+    }
+    loss_z2, extra_z2 = care_unsupervised_loss(
+        student,
+        [img],
+        [target_for_training(empty_z1, image_id=1)],
+        [empty_z1],
+        [z2_stable],
+        class_counts=counts,
+        kl_zone2_weight=0.0,  # isolate decoupled Zone-2 box regression!
+    )
+    assert loss_z2 is not None and torch.isfinite(loss_z2).item() and extra_z2["stability"] > 0.0
+    loss_z2.backward()
+    assert student.roi_heads.box_predictor.bbox_pred.weight.grad.abs().sum() > 0
+
+    # (d) Q1 suite auto-enables road_small anchors, stratified calibration, and sqrt batch LR scaling
+    q1_def = suite_parse(["--preset", "q1_a100"])
+    assert q1_def.anchor_profile == "road_small" and q1_def.stratify_calibration is True and q1_def.lr == pytest.approx(0.01)
+    q1_bs32 = suite_parse(["--preset", "q1_a100", "--batch-size", "32", "--grad-accum-steps", "1"])
+    assert q1_bs32.lr == pytest.approx(0.02)
+    q1_jobs = generate_jobs(q1_def)
+    assert "--anchor-profile" in q1_jobs[1]["command"] and "road_small" in q1_jobs[1]["command"]
+    assert "--stratify-calibration" in q1_jobs[1]["command"]
+

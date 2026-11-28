@@ -383,6 +383,7 @@ class WeightedConformalRiskCalibrator:
         num_vis_bins: int = 6,
         num_pava_bins: int = 12,
         iou_match: float = 0.50,
+        class_counts: dict[int, int] | None = None,
     ):
         self.num_classes = int(num_foreground_classes)
         self.alpha_strict = float(alpha_strict)
@@ -397,6 +398,9 @@ class WeightedConformalRiskCalibrator:
         self.num_vis_bins = int(num_vis_bins)
         self.num_pava_bins = int(num_pava_bins)
         self.iou_match = float(iou_match)
+        self.class_counts: dict[int, int] = {
+            int(k): int(v) for k, v in (class_counts or {}).items() if int(v) > 0
+        }
         self.grid = [round(0.05 + 0.02 * k, 4) for k in range(48)]  # 0.05 .. 0.99
 
         # Online empirical histogram of unlabeled RGB degradation scores d(x)
@@ -408,12 +412,24 @@ class WeightedConformalRiskCalibrator:
         self.regime_high: dict[str, float] = {"clear": 0.72, "degraded": 0.70}
         self.regime_low: dict[str, float] = {"clear": 0.48, "degraded": 0.46}
         self.class_high: dict[str, dict[int, float]] = {
-            "clear": {c: 0.72 for c in range(1, self.num_classes + 1)},
-            "degraded": {c: 0.70 for c in range(1, self.num_classes + 1)},
+            "clear": {
+                c: round(max(self.min_high, 0.72 - 0.10 * self._class_rarity(c)), 4)
+                for c in range(1, self.num_classes + 1)
+            },
+            "degraded": {
+                c: round(max(self.min_high, 0.70 - 0.10 * self._class_rarity(c)), 4)
+                for c in range(1, self.num_classes + 1)
+            },
         }
         self.class_low: dict[str, dict[int, float]] = {
-            "clear": {c: 0.48 for c in range(1, self.num_classes + 1)},
-            "degraded": {c: 0.46 for c in range(1, self.num_classes + 1)},
+            "clear": {
+                c: round(max(self.min_low, 0.48 - 0.06 * self._class_rarity(c)), 4)
+                for c in range(1, self.num_classes + 1)
+            },
+            "degraded": {
+                c: round(max(self.min_low, 0.46 - 0.06 * self._class_rarity(c)), 4)
+                for c in range(1, self.num_classes + 1)
+            },
         }
         default_pava = [round((k + 0.5) / self.num_pava_bins, 4) for k in range(self.num_pava_bins)]
         self.pava_precision: dict[str, list[float]] = {
@@ -422,6 +438,16 @@ class WeightedConformalRiskCalibrator:
         }
         self.calibration_count: int = 0
         self.last_diagnostics: dict[str, Any] = {}
+
+    def _class_rarity(self, cls_id: int) -> float:
+        """Log-frequency rarity score in [0, 1] computed strictly from labeled counts."""
+        if not self.class_counts:
+            return 0.0
+        max_cnt = max(1, max(self.class_counts.values()))
+        if max_cnt <= 1:
+            return 0.0
+        c_cnt = max(1, int(self.class_counts.get(int(cls_id), 0)))
+        return max(0.0, min(1.0, 1.0 - (math.log1p(c_cnt) / math.log1p(max_cnt))))
 
     def _vis_bin(self, degradation: float) -> int:
         idx = int(float(degradation) * self.num_vis_bins)
@@ -560,7 +586,7 @@ class WeightedConformalRiskCalibrator:
                 imgs_dev = [im.to(device) for im, _ in samples]
 
                 with autocast_ctx:
-                    probed_list, _ = teacher_bidirectional_probe(
+                    probed_list, probe_cache = teacher_bidirectional_probe(
                         teacher,
                         imgs_dev,
                         use_nwd=use_nwd,
@@ -568,10 +594,13 @@ class WeightedConformalRiskCalibrator:
                         nwd_constant=nwd_constant,
                         loc_alpha=loc_alpha,
                         cls_alpha=cls_alpha,
+                        enable_photometric_probe=self.use_visibility_weighting,
                     )
 
-                for (img_cpu, target), probed in zip(samples, probed_list):
-                    vis = estimate_visibility_degradation(img_cpu)
+                cached_vis = probe_cache.get("visibilities") or [
+                    estimate_visibility_degradation(im) for im, _ in samples
+                ]
+                for (_, target), vis, probed in zip(samples, cached_vis, probed_list):
                     deg = float(vis["degradation"])
                     regime_i = str(vis["regime"])
                     cal_degradations.append(deg)
@@ -722,17 +751,22 @@ class WeightedConformalRiskCalibrator:
                     max(self.min_low, min(sol_hi["threshold"] - 0.08, self.max_low, sol_lo["threshold"]))
                 )
 
-                # Per-class Empirical-Bayes shrinkage toward regime threshold (bounded to prevent
+                # Per-class Empirical-Bayes shrinkage toward tail-aware regime prior (bounded to prevent
                 # small-sample finite-sample penalty from inverting rare/small classes above car)
                 for cls_id in range(1, self.num_classes + 1):
+                    rarity = self._class_rarity(cls_id)
+                    prior_hi = max(self.min_high, self.regime_high[regime] - 0.10 * rarity)
+                    prior_lo = max(self.min_low, self.regime_low[regime] - 0.06 * rarity)
                     entries = per_class_entries[cls_id]
                     if self.use_visibility_weighting:
                         reg_entries = [e for e in entries if e[2] == regime]
                         if len(reg_entries) >= 8:
                             entries = reg_entries
                     if not entries:
-                        self.class_high[regime][cls_id] = self.regime_high[regime]
-                        self.class_low[regime][cls_id] = self.regime_low[regime]
+                        self.class_high[regime][cls_id] = round(prior_hi, 4)
+                        self.class_low[regime][cls_id] = round(
+                            max(self.min_low, min(prior_hi - 0.08, self.max_low, prior_lo)), 4
+                        )
                         continue
                     c_curves = [e[0] for e in entries]
                     c_degs = [e[1] for e in entries]
@@ -748,11 +782,11 @@ class WeightedConformalRiskCalibrator:
                     )
                     n_c = float(c_hi["n_eff"])
                     blend = n_c / (n_c + self.shrinkage_prior)
-                    shrunk_hi = blend * float(c_hi["threshold"]) + (1.0 - blend) * self.regime_high[regime]
-                    shrunk_lo = blend * float(c_lo["threshold"]) + (1.0 - blend) * self.regime_low[regime]
+                    shrunk_hi = blend * float(c_hi["threshold"]) + (1.0 - blend) * prior_hi
+                    shrunk_lo = blend * float(c_lo["threshold"]) + (1.0 - blend) * prior_lo
                     shrunk_hi = max(
                         self.min_high,
-                        min(self.max_high, self.regime_high[regime] + 0.05, max(self.regime_high[regime] - 0.12, shrunk_hi)),
+                        min(self.max_high, self.regime_high[regime] + 0.05, max(self.regime_high[regime] - 0.14, shrunk_hi)),
                     )
                     shrunk_lo = max(self.min_low, min(shrunk_hi - 0.08, self.max_low, shrunk_lo))
                     self.class_high[regime][cls_id] = round(shrunk_hi, 4)
@@ -783,7 +817,7 @@ class WeightedConformalRiskCalibrator:
         return diagnostics
 
     def state_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "num_classes": self.num_classes,
             "alpha_strict": self.alpha_strict,
             "alpha_loose": self.alpha_loose,
@@ -816,6 +850,9 @@ class WeightedConformalRiskCalibrator:
             },
             "calibration_count": int(self.calibration_count),
         }
+        if self.class_counts:
+            payload["class_counts"] = {int(k): int(v) for k, v in self.class_counts.items()}
+        return payload
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
         if not isinstance(state, dict):
@@ -832,6 +869,10 @@ class WeightedConformalRiskCalibrator:
             self.num_vis_bins = int(state["num_vis_bins"])
         if "num_pava_bins" in state:
             self.num_pava_bins = int(state["num_pava_bins"])
+        if "class_counts" in state and isinstance(state["class_counts"], dict):
+            self.class_counts = {
+                int(k): int(v) for k, v in state["class_counts"].items() if int(v) > 0
+            }
         if "unlabeled_vis_hist" in state:
             self.unlabeled_vis_hist = [float(v) for v in state["unlabeled_vis_hist"]]
         self.unlabeled_degraded_count = int(state.get("unlabeled_degraded_count", 0))
