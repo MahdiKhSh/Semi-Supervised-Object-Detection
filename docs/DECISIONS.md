@@ -70,5 +70,23 @@ and cross-GPU portable execution architecture.
   - `soft_teacher` (ICCV 2021): faithful Box Jittering localization filtering + Soft-Negative Background Classification Weighting via EMA Teacher background probabilities.
   - `consistent_teacher` (CVPR 2023): checkpoint-serializable per-class 1D 2-component GMM dynamic thresholding.
 - **Training Recipe & Cross-GPU Effective Batch Invariance**:
-  - Added `fasterrcnn_v2` (`fasterrcnn_resnet50_fpn_v2`), `max_side = 800`, `warmup_cosine` / `warmup_multistep` LR schedules, and `--grad-accum-steps`.
+  - Added `fasterrcnn_v2` (`fasterrcnn_resnet50_fpn_v2`), `max_side = 800`, `warmup_constant` / `warmup_cosine` / `warmup_multistep` LR schedules, `--unsup-warmup-steps`, and `--grad-accum-steps`.
   - Fingerprint uses `effective_batch_size = batch_size * grad_accum_steps` so Kaggle T4 (`2×4`) and RTX 5090 / L40s (`4×2` or `8×1`) resume seamlessly with identical per-step image ordering.
+
+## 11. Forensic Pilot Audit & CoRe-SSOD v2 Architecture Fixes (`native_training.py`, `care_ssod.py`, `conformal.py`, `baselines.py`)
+
+Forensic analysis of the first `q1_pilot_runs` (500-step warmup, 1500-step train, micro-batch 2×4) revealed that ALL SSOD variants trailed `supervised` (`0.1100` AP vs `mean_teacher 0.0797`, `soft_teacher 0.0754`, `consistent_teacher 0.0731`, `core_ssod 0.0598`) due to identifiable architectural and statistical bugs — fixed uniformly and fairly in v2:
+
+1. **FasterRCNN-v2 Normalization & EMAN Buffer Fix**: TorchVision `fasterrcnn_resnet50_fpn_v2` contains 65 active `nn.BatchNorm2d` layers (53 backbone + 8 FPN + 4 RoI head). Micro-batch=2 + augmented unlabeled forward passes corrupted BN statistics, while `ema_update` hard-copied student BN buffers directly into the lagging EMA teacher (`mean_teacher` Student AP `0.1219` vs Teacher AP `0.0866`, a `-3.53` AP collapse!). **Fix**: Convert `backbone.body` BNs to `FrozenBatchNorm2d` (preserving ImageNet-V2 stats), convert FPN/RPN/RoI BNs to `GroupNorm(32, C)` (Wu & He, ECCV'18 — strictly batch-size invariant across `2×4` and `4×2`), and upgrade `ema_update` to EMAN (EMA float buffers, Cai et al., CVPR'21).
+2. **Schedule, Burn-In, Unsup Ramp-Up & Labeled Flip (Uniform Across All Variants)**:
+   - Burn-in `warmup` now uses `warmup_constant` (no LR decay to 0 before SSOD starts) and 1,500 steps in `q1_pilot` (1.71 epochs on 10% BDD100K) / 3,000 steps in `q1_paper`.
+   - Added `--unsup-warmup-steps` linear ramp (`300` for `q1_pilot`, `1000` for `q1_paper`) and schedule-matched EMA (`0.996` for 3k pilot, `0.9985` for 12k paper).
+   - Added deterministic per-slot 50% horizontal flip on labeled batches across all variants.
+3. **CoRe-SSOD v2 Algorithmic Upgrades**:
+   - **Direct Bidirectional Cross-View RoI Probing + Weighted Box Fusion**: Replaces double RPN/NMS + $O(N^2)$ greedy matching with single-RPN + flipped-backbone RoI probing and consensus box fusion (`+1.06` TP IoU, `+57` TPs, `4.7×` faster calibration, `+45%` small-object recall at 15% FDR).
+   - **Exact Monotone Bounded FP-per-GT Conformal Risk Control + 1D PAVA**: Replaces conservative suffix-max FDP (which inflated risk +35% and crushed night recall to `<8%`) with naturally monotone $L_{\text{FPR}}(x;\lambda) = \min(1, \text{FP}(\lambda)/\max(1,|G|))$ ($\alpha_{\text{strict}}=0.08, \alpha_{\text{loose}}=0.30$), true regime-conditional density ratios $p_U(\text{bin}|r)/p_{\text{cal}}(\text{bin}|r)$, candidate-conditioned per-class calibration, and simultaneous PAVA precision $\hat{\pi}_r(q)$.
+   - **RPN Zone-2 Ignore + ROI Conformal Soft-Negative Weighting**: Replaces hard background proposal deletion (which caused a 50,000-detection FP explosion in v1 `core_ssod`) with RPN Zone-2 ignore masking (`-1`), normalized ROI background weighting $p_T(\text{bg}) \cdot (1 - \hat{\pi}_r(q_{z_2}))$ (mean `1.0`), localization-gated Smooth-L1 + sampled-proposal GIoU (`0.25`), and calibrated linear-$T$ KL distillation (`0.15`/`0.05`, $T=1.5$).
+4. **Faithful Baseline Corrections (`baselines.py`)**:
+   - `soft_teacher`: strictly decouples `cls_valid` (RPN + ROI soft-negative classification) from jitter-verified `reg_valid` (ROI box regression only).
+   - `consistent_teacher`: filters GMM inputs to `score >= 0.15` and solves the exact Bayes Gaussian posterior decision boundary (preventing collapse into the background noise tail).
+5. **Deterministic Multi-Worker I/O Prefetching & Batched AMP Eval/Calibration**: Overlaps PIL decode/resize with GPU compute using stateless per-step index prefetching and batched AMP evaluation/calibration without altering determinism or crash-safe incremental resumption.

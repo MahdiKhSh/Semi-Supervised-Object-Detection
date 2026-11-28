@@ -95,10 +95,12 @@ def parse_args(argv=None):
     p.add_argument("--lr", type=float, default=None)
     p.add_argument(
         "--lr-schedule",
-        choices=("constant", "multistep", "cosine", "warmup_cosine", "warmup_multistep"),
+        choices=("constant", "multistep", "cosine", "warmup_constant", "warmup_cosine", "warmup_multistep"),
         default=None,
     )
     p.add_argument("--lr-warmup-steps", type=int, default=None)
+    p.add_argument("--ema", type=float, default=None)
+    p.add_argument("--unsup-warmup-steps", type=int, default=None)
     p.add_argument("--save-every", type=int, default=None)
     p.add_argument("--amp", choices=("auto", "off", "fp16", "bf16"), default="auto")
     p.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
@@ -143,7 +145,7 @@ def parse_args(argv=None):
                     setattr(args, key, Path(saved_args[key]))
             for key in (
                 "device", "amp", "batch_size", "grad_accum_steps", "detector",
-                "lr", "lr_schedule", "lr_warmup_steps",
+                "lr", "lr_schedule", "lr_warmup_steps", "ema", "unsup_warmup_steps",
                 "warmup_steps", "train_steps", "max_side", "save_every",
             ):
                 if saved_args.get(key) is not None and getattr(args, key) in (None, "auto"):
@@ -165,7 +167,11 @@ def parse_args(argv=None):
     if args.lr_schedule is None:
         args.lr_schedule = "warmup_cosine" if is_q1 else "constant"
     if args.lr_warmup_steps is None:
-        args.lr_warmup_steps = 500 if args.preset == "q1_paper" else (150 if args.preset == "q1_pilot" else 0)
+        args.lr_warmup_steps = 500 if args.preset == "q1_paper" else (250 if args.preset == "q1_pilot" else 0)
+    if args.ema is None:
+        args.ema = 0.9985 if args.preset == "q1_paper" else (0.996 if args.preset == "q1_pilot" else 0.999)
+    if args.unsup_warmup_steps is None:
+        args.unsup_warmup_steps = 1000 if args.preset == "q1_paper" else (300 if args.preset == "q1_pilot" else 0)
 
     if args.output is None:
         args.output = _default_output_for_preset(args.preset)
@@ -250,7 +256,7 @@ def experiment_plan(preset, train_steps=None, warmup_steps=None, max_side=None):
             ("consistent_teacher", 0.7, "consistent_teacher", {}),
             ("core_ssod", 0.7, "core_ssod", {}),
         ]
-        return specs, selected, warmup_steps or 500, train_steps or 1500, max_side or 800
+        return specs, selected, warmup_steps or 1500, train_steps or 3000, max_side or 800
     if preset == "q1_paper":
         specs = tuple((f, s) for f in PAPER_FRACTIONS for s in PAPER_SEEDS)
         selected = [
@@ -307,15 +313,31 @@ def generate_jobs(args):
         amp_arg = "off"
     eval_every = (
         str(train_steps)
-        if args.preset in ("smoke", "pilot", "q1_pilot")
-        else ("3000" if args.preset == "q1_paper" else "2000")
+        if args.preset in ("smoke", "pilot")
+        else (
+            str(max(1, train_steps // 2))
+            if args.preset == "q1_pilot"
+            else ("3000" if args.preset == "q1_paper" else "2000")
+        )
+    )
+    is_q1 = args.preset in ("q1_pilot", "q1_paper")
+    ema_val = float(getattr(args, "ema", 0.999))
+    unsup_wu_val = int(getattr(args, "unsup_warmup_steps", 0))
+    lr_sched_train = str(getattr(args, "lr_schedule", "constant"))
+    lr_wu_train = int(getattr(args, "lr_warmup_steps", 0))
+    # Warmup burn-in ends at peak LR (warmup_constant) instead of decaying LR to 0 before SSOD starts!
+    warmup_sched = "warmup_constant" if (is_q1 and lr_sched_train != "constant") else lr_sched_train
+    warmup_lr_wu = (
+        min(200 if args.preset == "q1_pilot" else 300, max(1, warmup_steps // 4))
+        if is_q1
+        else lr_wu_train
     )
     jobs = []
     for fraction, seed in specs:
         frac_tag = f"{round(100 * fraction):02d}pct"
         split = args.output / "splits" / f"{frac_tag}_s{seed}"
         root = args.output / "runs" / f"{frac_tag}_s{seed}"
-        base = [
+        common = [
             "--data-root", str(split),
             "--train-images", str(args.train_images),
             "--val-images", str(args.val_images),
@@ -325,19 +347,31 @@ def generate_jobs(args):
             "--grad-accum-steps", str(getattr(args, "grad_accum_steps", 1)),
             "--max-side", str(side),
             "--lr", str(getattr(args, "lr", 0.003)),
-            "--lr-schedule", str(getattr(args, "lr_schedule", "constant")),
-            "--lr-warmup-steps", str(getattr(args, "lr_warmup_steps", 0)),
             "--seed", str(seed),
             "--save-every", str(save_every),
-            "--eval-every", eval_every,
             "--amp", amp_arg,
         ]
         if args.preset == "smoke":
-            base += ["--no-pretrained-backbone", "--eval-max-images", "4"]
+            common += ["--no-pretrained-backbone", "--eval-max-images", "4"]
         elif args.preset == "pilot":
-            base += ["--eval-max-images", "50"]
+            common += ["--eval-max-images", "50"]
         elif args.preset == "q1_pilot":
-            base += ["--eval-max-images", "500"]
+            common += ["--eval-max-images", "500"]
+
+        warmup_base = [
+            *common,
+            "--lr-schedule", warmup_sched,
+            "--lr-warmup-steps", str(warmup_lr_wu),
+            "--eval-every", str(warmup_steps),
+        ]
+        base = [
+            *common,
+            "--lr-schedule", lr_sched_train,
+            "--lr-warmup-steps", str(lr_wu_train),
+            "--ema", str(ema_val),
+            "--unsup-warmup-steps", str(unsup_wu_val),
+            "--eval-every", eval_every,
+        ]
         prepare_cmd = [
             sys.executable, str(ROOT / "scripts" / "prepare_bdd100k.py"),
             "--train-labels", str(args.train_labels),
@@ -361,7 +395,7 @@ def generate_jobs(args):
             "--variant", "supervised",
             "--steps", str(warmup_steps),
             "--output", str(warmup_output),
-            *base,
+            *warmup_base,
         ]
         jobs.append({
             "name": f"{frac_tag}_s{seed}/warmup",
@@ -372,6 +406,10 @@ def generate_jobs(args):
             "seed": seed,
             "threshold": 0.7,
             "max_side": side,
+            "lr_schedule": warmup_sched,
+            "lr_warmup_steps": warmup_lr_wu,
+            "ema": ema_val,
+            "unsup_warmup_steps": 0,
             "kwargs": {},
             "split_dir": str(split),
             "output": str(warmup_output),
@@ -393,6 +431,9 @@ def generate_jobs(args):
             ):
                 continue
             output = root / tag
+            eff_kw = dict(kw)
+            if variant == "core_ssod" and is_q1 and "conformal_every" not in eff_kw:
+                eff_kw["conformal_every"] = 300 if args.preset == "q1_pilot" else 500
             run_cmd = [
                 sys.executable, "-m", "ssod_research.native_training",
                 "--variant", variant,
@@ -402,7 +443,7 @@ def generate_jobs(args):
                 "--pseudo-threshold", str(threshold),
                 *base,
             ]
-            for key, value in kw.items():
+            for key, value in eff_kw.items():
                 run_cmd += ["--" + key.replace("_", "-"), str(value)]
             jobs.append({
                 "name": f"{frac_tag}_s{seed}/{tag}",
@@ -413,7 +454,11 @@ def generate_jobs(args):
                 "seed": seed,
                 "threshold": threshold,
                 "max_side": side,
-                "kwargs": dict(kw),
+                "lr_schedule": lr_sched_train,
+                "lr_warmup_steps": lr_wu_train,
+                "ema": ema_val,
+                "unsup_warmup_steps": unsup_wu_val,
+                "kwargs": eff_kw,
                 "split_dir": str(split),
                 "output": str(output),
                 "steps": train_steps,
@@ -544,8 +589,10 @@ def build_pipeline_dag(args, jobs: list[dict] | None = None) -> PipelineDAG:
             "effective_batch_size": int(args.batch_size) * int(getattr(args, "grad_accum_steps", 1)),
             "max_side": int(job["max_side"]),
             "lr": float(getattr(args, "lr", 0.003)),
-            "lr_schedule": str(getattr(args, "lr_schedule", "constant")),
-            "lr_warmup_steps": int(getattr(args, "lr_warmup_steps", 0)),
+            "lr_schedule": str(job.get("lr_schedule", getattr(args, "lr_schedule", "constant"))),
+            "lr_warmup_steps": int(job.get("lr_warmup_steps", getattr(args, "lr_warmup_steps", 0))),
+            "ema": float(job.get("ema", getattr(args, "ema", 0.999))),
+            "unsup_warmup_steps": int(job.get("unsup_warmup_steps", getattr(args, "unsup_warmup_steps", 0))),
             "steps": int(job["steps"]),
             "pretrained_backbone": args.preset != "smoke",
             "kwargs": job.get("kwargs", {}),
@@ -738,6 +785,7 @@ def job_complete(job):
     # so Kaggle 2x4 -> RTX 5090 4x2 transfers resume cleanly!).
     for flag in (
         "variant", "detector", "seed", "max_side", "pseudo_threshold",
+        "lr_schedule", "ema", "unsup_warmup_steps",
         "box_weight", "class_weight", "confidence_weight",
         "localization_scale", "localization_enabled", "adaptive_strength",
         "condition_offset", "consistency_weight",
@@ -939,6 +987,8 @@ def _mirror_workspace_state(args, registry: ExperimentRegistry) -> None:
             "lr": args.lr,
             "lr_schedule": args.lr_schedule,
             "lr_warmup_steps": args.lr_warmup_steps,
+            "ema": args.ema,
+            "unsup_warmup_steps": args.unsup_warmup_steps,
             "warmup_steps": args.warmup_steps,
             "train_steps": args.train_steps,
             "max_side": args.max_side,
@@ -1207,7 +1257,7 @@ def _run_reports_and_plots(args, registry: ExperimentRegistry, dag: PipelineDAG,
             runtime_delta_sec=time.monotonic() - t0,
         )
 
-    if args.preset in ("core", "care", "q1_paper", "paper"):
+    if args.preset in ("core", "care", "q1_pilot", "q1_paper", "paper"):
         t1 = time.monotonic()
         from plot_results import render
         fig_dir = render(args.output)
@@ -1347,6 +1397,8 @@ def main(argv=None):
                 "lr": args.lr,
                 "lr_schedule": args.lr_schedule,
                 "lr_warmup_steps": args.lr_warmup_steps,
+                "ema": args.ema,
+                "unsup_warmup_steps": args.unsup_warmup_steps,
                 "warmup_steps": args.warmup_steps,
                 "train_steps": args.train_steps,
                 "max_side": args.max_side,

@@ -4,13 +4,21 @@ Provides apples-to-apples comparisons under the exact same backbone, image
 resolution, optimizer, LR schedule, and supervised warm-start checkpoint:
 
 1. ``soft_teacher`` (Xu et al., ICCV 2021):
-   - Box Jittering localization reliability estimation on teacher FPN features.
-   - Soft-Negative Background Classification Weighting: background ROI proposals
-     are weighted by normalized EMA Teacher background probability r_j = p_T(bg)
-     so missed foreground objects are not crushed as hard negatives.
+   - Strictly decoupled classification vs regression pseudo-label filtering:
+     * Classification & RPN targets use high-confidence ``cls_valid`` boxes
+       (``score >= cls_threshold``), preventing low-score false positives from
+       poisoning RPN/ROI classification.
+     * Box regression targets use Box-Jittering variance-verified ``reg_valid``
+       boxes (``score >= reg_threshold`` and normalized regression std
+       ``<= jitter_thresh``).
+   - Soft-Negative Background Classification Weighting (Eq. 5 of Soft Teacher):
+     background ROI proposals are weighted by normalized EMA Teacher background
+     probability ``r_j = p_T(bg) / mean(p_T(bg))`` so missed foreground objects
+     are not crushed as hard negatives.
 2. ``consistent_teacher`` (Wang et al., CVPR 2023 — dynamic GMM thresholding):
-   - Online 2-component 1D Gaussian Mixture Model (EM) per class separating
-     high-confidence foreground from low-confidence noise without fixed cutoffs.
+   - Online 2-component 1D Gaussian Mixture Model (EM) per class on non-trivial
+     candidate scores (``>= 0.15``) with Bayes-optimal Gaussian posterior
+     decision boundary separating foreground from background noise.
    - Checkpoint-serializable sliding score buffers for exact deterministic resume.
 """
 from __future__ import annotations
@@ -32,12 +40,16 @@ def soft_teacher_extract(
     *,
     cls_threshold: float = 0.70,
     reg_threshold: float = 0.50,
-    jitter_times: int = 4,
+    jitter_times: int = 6,
     jitter_scale: float = 0.06,
-    jitter_thresh: float = 0.04,
+    jitter_thresh: float = 0.03,
     rng=None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
-    """Run EMA Teacher once, cache FPN features, and score boxes via Box Jittering."""
+    """Run EMA Teacher once, cache FPN features, and score boxes via Box Jittering.
+
+    Strictly separates ``cls_valid`` (score >= cls_threshold) from ``reg_valid``
+    (score >= reg_threshold & norm_std <= jitter_thresh) as in Xu et al., ICCV 2021.
+    """
     teacher.eval()
     original_sizes = [(int(im.shape[-2]), int(im.shape[-1])) for im in images]
     transformed, _ = teacher.transform(images, None)
@@ -67,12 +79,12 @@ def soft_teacher_extract(
                 "boxes": boxes.new_zeros((0, 4)),
                 "labels": labels.new_zeros((0,), dtype=torch.long),
                 "scores": scores.new_zeros((0,)),
+                "cls_valid": torch.zeros((0,), dtype=torch.bool, device=boxes.device),
                 "reg_valid": torch.zeros((0,), dtype=torch.bool, device=boxes.device),
                 "jitter_std": scores.new_zeros((0,)),
             })
             continue
 
-        # Scale candidate boxes to teacher's transformed image coordinates for box jittering
         oh, ow = orig_sz
         th, tw = trans_sz
         sy = float(th) / max(1, oh)
@@ -84,10 +96,10 @@ def soft_teacher_extract(
         w = (scaled[:, 2] - scaled[:, 0]).clamp(min=1.0)
         h = (scaled[:, 3] - scaled[:, 1]).clamp(min=1.0)
 
-        # Jitter K times and measure normalized coordinate std after Teacher ROI regression
         refined_list = []
         single_feat = {k: v[img_idx:img_idx + 1] for k, v in t_features.items()}
-        for _ in range(max(2, int(jitter_times))):
+        k_jit = max(2, int(jitter_times))
+        for _ in range(k_jit):
             if rng is not None:
                 noise_vals = [rng.uniform(-jitter_scale, jitter_scale) for _ in range(len(scaled) * 4)]
                 noise = torch.tensor(noise_vals, device=scaled.device, dtype=scaled.dtype).reshape(-1, 4)
@@ -98,14 +110,13 @@ def soft_teacher_extract(
             jittered[:, 1] = (scaled[:, 1] + noise[:, 1] * h).clamp(0.0, float(th))
             jittered[:, 2] = (scaled[:, 2] + noise[:, 2] * w).clamp(0.0, float(tw))
             jittered[:, 3] = (scaled[:, 3] + noise[:, 3] * h).clamp(0.0, float(th))
-            # Ensure x2 > x1 and y2 > y1
             jittered[:, 2] = torch.maximum(jittered[:, 2], jittered[:, 0] + 1.0)
             jittered[:, 3] = torch.maximum(jittered[:, 3], jittered[:, 1] + 1.0)
 
             roi_f = teacher.roi_heads.box_roi_pool(single_feat, [jittered], [trans_sz])
             roi_f = teacher.roi_heads.box_head(roi_f)
             _, reg_deltas = teacher.roi_heads.box_predictor(roi_f)
-            decoded = teacher.roi_heads.box_coder.decode(reg_deltas, [jittered])
+            decoded = teacher.roi_heads.box_coder.decode(reg_deltas.float(), [jittered.float()])
             rows = torch.arange(len(cand_labels), device=cand_labels.device)
             refined = decoded[rows, cand_labels.long()]
             refined_list.append(refined)
@@ -124,26 +135,40 @@ def soft_teacher_extract(
         out_boxes = cand_boxes[final_keep].detach()
         out_labels = cand_labels[final_keep].detach()
         out_scores = cand_scores[final_keep].detach()
+        out_cls = cls_keep[final_keep].detach()
         out_reg = reg_keep[final_keep].detach()
         out_std = norm_std[final_keep].detach()
 
-        stats["accepted"] += len(out_boxes)
+        stats["accepted"] += int(out_cls.sum().item())
         stats["reg_accepted"] += int(out_reg.sum().item())
-        stats["quality_sum"] += float(out_scores.sum().item())
+        stats["quality_sum"] += float(out_scores[out_cls].sum().item()) if bool(out_cls.any()) else 0.0
         results.append({
             "boxes": out_boxes,
             "labels": out_labels,
             "scores": out_scores,
+            "cls_valid": out_cls,
             "reg_valid": out_reg,
             "jitter_std": out_std,
         })
 
     teacher_cache = {
-        "features": t_features,
-        "transformed_sizes": transformed.image_sizes,
+        "features": {k: v.detach() for k, v in t_features.items()},
+        "transformed_sizes": list(transformed.image_sizes),
         "original_sizes": original_sizes,
     }
     return results, stats, teacher_cache
+
+
+def _slice_target_by_mask(target: dict[str, torch.Tensor], mask: torch.Tensor) -> dict[str, torch.Tensor]:
+    out = {
+        "boxes": target["boxes"][mask],
+        "labels": target["labels"][mask],
+        "image_id": target["image_id"],
+    }
+    b = out["boxes"]
+    out["area"] = ((b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])).clamp(min=0.0)
+    out["iscrowd"] = torch.zeros(len(b), dtype=torch.long, device=b.device)
+    return out
 
 
 def soft_teacher_unsupervised_loss(
@@ -154,94 +179,122 @@ def soft_teacher_unsupervised_loss(
     flips: list[bool],
     reg_valid_list: list[torch.Tensor],
     teacher_cache: dict[str, Any],
+    *,
+    cls_valid_list: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor | None, dict[str, float]]:
-    """Soft Teacher (ICCV 2021) unsupervised loss with soft-negative bg weighting."""
-    if not any(len(t["boxes"]) > 0 for t in aug_targets):
+    """Faithful Soft Teacher (ICCV 2021) unsupervised loss with decoupled cls/reg & soft-negatives."""
+    if cls_valid_list is None:
+        cls_targets = aug_targets
+    else:
+        cls_targets = [
+            _slice_target_by_mask(t, m.to(t["boxes"].device))
+            for t, m in zip(aug_targets, cls_valid_list)
+        ]
+    reg_targets = [
+        _slice_target_by_mask(t, m.to(t["boxes"].device))
+        for t, m in zip(aug_targets, reg_valid_list)
+    ]
+
+    has_cls = any(len(t["boxes"]) > 0 for t in cls_targets)
+    has_reg = any(len(t["boxes"]) > 0 for t in reg_targets)
+    if not has_cls and not has_reg:
         return None, {"unsup": 0.0, "stability": 0.0}
 
     original_sizes = [(int(im.shape[-2]), int(im.shape[-1])) for im in aug_images]
-    transformed, transformed_targets = model.transform(aug_images, aug_targets)
+    transformed, trans_cls_targets = model.transform(aug_images, cls_targets if has_cls else None)
     s_features = model.backbone(transformed.tensors)
     if isinstance(s_features, torch.Tensor):
         s_features = {"0": s_features}
 
-    proposals, rpn_losses = model.rpn(transformed, s_features, transformed_targets)
-    sampled_props, matched_idxs, labels_list, reg_targets_list = model.roi_heads.select_training_samples(
-        proposals, transformed_targets
-    )
-
-    # Compute student ROI logits & regressions
-    box_features = model.roi_heads.box_roi_pool(s_features, sampled_props, transformed.image_sizes)
-    box_features = model.roi_heads.box_head(box_features)
-    class_logits, box_regression = model.roi_heads.box_predictor(box_features)
-
-    # Map student sampled proposals back to weak teacher coordinates to obtain soft bg weights r_j
-    t_props_list = []
-    for props, was_flipped, s_sz, o_sz, t_sz in zip(
-        sampled_props,
-        flips,
-        transformed.image_sizes,
-        original_sizes,
-        teacher_cache["transformed_sizes"],
-    ):
-        p = props.detach().clone()
-        # Student transformed -> original coords
-        p[:, [0, 2]] *= float(o_sz[1]) / max(1, s_sz[1])
-        p[:, [1, 3]] *= float(o_sz[0]) / max(1, s_sz[0])
-        if was_flipped:
-            p = _flip_boxes_x(p, o_sz[1])
-        # Original -> teacher transformed coords
-        p[:, [0, 2]] *= float(t_sz[1]) / max(1, o_sz[1])
-        p[:, [1, 3]] *= float(t_sz[0]) / max(1, o_sz[0])
-        t_props_list.append(p)
-
-    with torch.no_grad():
-        t_roi_f = teacher.roi_heads.box_roi_pool(
-            teacher_cache["features"], t_props_list, teacher_cache["transformed_sizes"]
+    total = None
+    # 1. RPN + Soft-Negative Classification on cls_valid targets ONLY
+    if has_cls and trans_cls_targets is not None:
+        proposals, rpn_losses = model.rpn(transformed, s_features, trans_cls_targets)
+        sampled_props, _, labels_list, _ = model.roi_heads.select_training_samples(
+            proposals, trans_cls_targets
         )
-        t_roi_f = teacher.roi_heads.box_head(t_roi_f)
-        t_logits, _ = teacher.roi_heads.box_predictor(t_roi_f)
-        t_bg_probs = F.softmax(t_logits.float(), dim=-1)[:, 0].detach()  # column 0 = background
+        box_features = model.roi_heads.box_roi_pool(s_features, sampled_props, transformed.image_sizes)
+        box_features = model.roi_heads.box_head(box_features)
+        class_logits, _ = model.roi_heads.box_predictor(box_features)
 
-    labels = torch.cat(labels_list, dim=0)
-    regression_targets = torch.cat(reg_targets_list, dim=0)
+        # Map student sampled proposals back to weak teacher coordinates for soft bg weights r_j
+        t_props_list = []
+        for props, was_flipped, s_sz, o_sz, t_sz in zip(
+            sampled_props,
+            flips,
+            transformed.image_sizes,
+            original_sizes,
+            teacher_cache["transformed_sizes"],
+        ):
+            p = props.detach().clone()
+            p[:, [0, 2]] *= float(o_sz[1]) / max(1, s_sz[1])
+            p[:, [1, 3]] *= float(o_sz[0]) / max(1, s_sz[0])
+            if was_flipped:
+                p = _flip_boxes_x(p, o_sz[1])
+            p[:, [0, 2]] *= float(t_sz[1]) / max(1, o_sz[1])
+            p[:, [1, 3]] *= float(t_sz[0]) / max(1, o_sz[0])
+            t_props_list.append(p)
 
-    # Eq. 5 of Soft Teacher: foreground weight = 1, background weight = r_j / mean(r_bg)
-    per_sample_cls = F.cross_entropy(class_logits.float(), labels, reduction="none")
-    fg_mask = labels > 0
-    bg_mask = labels == 0
-    weights = torch.ones_like(per_sample_cls)
-    if bool(bg_mask.any()):
-        bg_r = t_bg_probs[bg_mask].clamp(min=1e-4)
-        weights[bg_mask] = bg_r / bg_r.mean().clamp(min=1e-4)
-    loss_cls = (per_sample_cls * weights).sum() / weights.sum().clamp(min=1.0)
+        with torch.no_grad():
+            t_roi_f = teacher.roi_heads.box_roi_pool(
+                teacher_cache["features"], t_props_list, teacher_cache["transformed_sizes"]
+            )
+            t_roi_f = teacher.roi_heads.box_head(t_roi_f)
+            t_logits, _ = teacher.roi_heads.box_predictor(t_roi_f)
+            t_bg_probs = F.softmax(t_logits.float(), dim=-1)[:, 0].detach()
 
-    # Box regression only on foreground proposals matched to jitter-verified boxes
-    reg_keep_per_prop = []
-    for m_idx, r_valid in zip(matched_idxs, reg_valid_list):
-        if len(r_valid) == 0:
-            reg_keep_per_prop.append(torch.zeros(len(m_idx), dtype=torch.bool, device=m_idx.device))
-        else:
-            clamped = m_idx.clamp(min=0, max=len(r_valid) - 1)
-            reg_keep_per_prop.append(r_valid[clamped])
-    reg_valid_mask = fg_mask & torch.cat(reg_keep_per_prop, dim=0)
-
-    sampled_pos_inds = torch.where(reg_valid_mask)[0]
-    if len(sampled_pos_inds) > 0:
-        n_total, num_classes = class_logits.shape
-        box_reg = box_regression.reshape(n_total, num_classes, 4)
-        labels_pos = labels[sampled_pos_inds]
-        loss_box = F.smooth_l1_loss(
-            box_reg[sampled_pos_inds, labels_pos],
-            regression_targets[sampled_pos_inds],
-            beta=1.0 / 9.0,
-            reduction="sum",
-        ) / max(1, labels.numel())
+        labels = torch.cat(labels_list, dim=0)
+        per_sample_cls = F.cross_entropy(class_logits.float(), labels, reduction="none")
+        bg_mask = labels == 0
+        weights = torch.ones_like(per_sample_cls)
+        if bool(bg_mask.any()):
+            bg_r = t_bg_probs[bg_mask].clamp(min=1e-4)
+            weights[bg_mask] = bg_r / bg_r.mean().clamp(min=1e-4)
+        loss_cls = (per_sample_cls * weights).sum() / weights.sum().clamp(min=1.0)
+        rpn_total = sum(rpn_losses.values())
+        total = rpn_total + loss_cls
     else:
-        loss_box = box_regression.sum() * 0.0
+        # Still generate proposals (eval/no-target RPN path) for jitter-verified box regression
+        proposals, _ = model.rpn(transformed, s_features, None)
 
-    rpn_total = sum(rpn_losses.values())
-    total = rpn_total + loss_cls + loss_box
+    # 2. Box regression ONLY on foreground proposals matched to jitter-verified reg_valid targets
+    if has_reg:
+        # Transform reg_targets to student transformed coordinates without redoing backbone
+        trans_reg_targets = []
+        for tgt, (oh, ow), (th, tw) in zip(reg_targets, original_sizes, transformed.image_sizes):
+            b = tgt["boxes"].clone()
+            if len(b):
+                b[:, [0, 2]] *= float(tw) / max(1, ow)
+                b[:, [1, 3]] *= float(th) / max(1, oh)
+            trans_reg_targets.append({"boxes": b, "labels": tgt["labels"]})
+
+        reg_props, _, reg_labels_list, reg_gt_deltas_list = model.roi_heads.select_training_samples(
+            proposals, trans_reg_targets
+        )
+        reg_labels = torch.cat(reg_labels_list, dim=0)
+        reg_gt_deltas = torch.cat(reg_gt_deltas_list, dim=0)
+        pos_inds = torch.where(reg_labels > 0)[0]
+        if len(pos_inds) > 0:
+            # Pool only positive proposals per image to keep compute minimal
+            pos_props_per_img = []
+            for p_img, l_img in zip(reg_props, reg_labels_list):
+                pos_props_per_img.append(p_img[l_img > 0])
+            pos_feats = model.roi_heads.box_roi_pool(s_features, pos_props_per_img, transformed.image_sizes)
+            pos_feats = model.roi_heads.box_head(pos_feats)
+            pos_logits, pos_box_reg = model.roi_heads.box_predictor(pos_feats)
+            n_pos, num_classes = pos_logits.shape
+            pos_box_reg = pos_box_reg.reshape(n_pos, num_classes, 4)
+            labels_pos = reg_labels[pos_inds]
+            loss_box = F.smooth_l1_loss(
+                pos_box_reg[torch.arange(n_pos, device=labels_pos.device), labels_pos],
+                reg_gt_deltas[pos_inds],
+                beta=1.0 / 9.0,
+                reduction="sum",
+            ) / max(1, reg_labels.numel())
+            total = loss_box if total is None else (total + loss_box)
+
+    if total is None:
+        return None, {"unsup": 0.0, "stability": 0.0}
     return total, {"unsup": float(total.detach()), "stability": 0.0}
 
 
@@ -251,14 +304,17 @@ def _fit_1d_two_component_gmm(
     *,
     max_iter: int = 15,
     eps: float = 1e-6,
-) -> tuple[float, float, float, float]:
-    """Fit a deterministic 2-component 1D GMM via EM; return (mu_lo, sd_lo, mu_hi, sd_hi)."""
+) -> tuple[float, float, float, float, float, float]:
+    """Fit a deterministic 2-component 1D GMM via EM.
+
+    Returns ``(mu_lo, sd_lo, mu_hi, sd_hi, pi_lo, pi_hi)`` with ``mu_lo <= mu_hi``.
+    """
     xs = sorted(float(v) for v in values)
     n = len(xs)
     q25 = xs[n // 4]
     q75 = xs[(3 * n) // 4]
     mu0, mu1 = q25, max(q75, q25 + 0.05)
-    var0 = var1 = 0.04
+    var0 = var1 = 0.03
     pi0 = pi1 = 0.5
 
     def _gauss(x: float, mu: float, var: float) -> float:
@@ -293,7 +349,34 @@ def _fit_1d_two_component_gmm(
     if mu0 > mu1:
         mu0, mu1 = mu1, mu0
         var0, var1 = var1, var0
-    return mu0, math.sqrt(var0), mu1, math.sqrt(var1)
+        pi0, pi1 = pi1, pi0
+    return mu0, math.sqrt(var0), mu1, math.sqrt(var1), pi0, pi1
+
+
+def _gmm_bayes_boundary(mu0: float, sd0: float, pi0: float, mu1: float, sd1: float, pi1: float) -> float:
+    """Find x in [mu0, mu1] where pi1 * N(x; mu1, sd1^2) == pi0 * N(x; mu0, sd0^2)."""
+    if mu1 <= mu0 + 1e-4:
+        return mu1
+
+    def _log_diff(x: float) -> float:
+        s0 = max(sd0, 1e-3)
+        s1 = max(sd1, 1e-3)
+        lp1 = math.log(max(pi1, 1e-6)) - math.log(s1) - 0.5 * ((x - mu1) / s1) ** 2
+        lp0 = math.log(max(pi0, 1e-6)) - math.log(s0) - 0.5 * ((x - mu0) / s0) ** 2
+        return lp1 - lp0
+
+    lo, hi = mu0, mu1
+    if _log_diff(lo) >= 0.0:
+        return mu1 - 0.35 * sd1
+    if _log_diff(hi) <= 0.0:
+        return mu1
+    for _ in range(20):
+        mid = 0.5 * (lo + hi)
+        if _log_diff(mid) < 0.0:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
 
 
 class DynamicGMMThreshold:
@@ -306,13 +389,15 @@ class DynamicGMMThreshold:
         base_threshold: float = 0.70,
         buffer_size: int = 256,
         min_samples: int = 20,
-        min_threshold: float = 0.35,
+        min_score_input: float = 0.15,
+        min_threshold: float = 0.50,
         max_threshold: float = 0.90,
     ):
         self.num_classes = int(num_foreground_classes)
         self.base_threshold = float(base_threshold)
         self.buffer_size = int(buffer_size)
         self.min_samples = int(min_samples)
+        self.min_score_input = float(min_score_input)
         self.min_threshold = float(min_threshold)
         self.max_threshold = float(max_threshold)
         self.buffers: dict[int, list[float]] = {c: [] for c in range(1, self.num_classes + 1)}
@@ -322,7 +407,7 @@ class DynamicGMMThreshold:
         touched: set[int] = set()
         for cls_id, sc in zip(labels, scores):
             cls_id = int(cls_id)
-            if cls_id in self.buffers and 0.05 <= float(sc) <= 1.0:
+            if cls_id in self.buffers and self.min_score_input <= float(sc) <= 1.0:
                 buf = self.buffers[cls_id]
                 buf.append(float(sc))
                 if len(buf) > self.buffer_size:
@@ -331,8 +416,12 @@ class DynamicGMMThreshold:
         for cls_id in touched:
             buf = self.buffers[cls_id]
             if len(buf) >= self.min_samples:
-                _, _, mu_hi, sd_hi = _fit_1d_two_component_gmm(buf)
-                tau = max(self.min_threshold, min(self.max_threshold, mu_hi - 0.5 * sd_hi))
+                mu_lo, sd_lo, mu_hi, sd_hi, pi_lo, pi_hi = _fit_1d_two_component_gmm(buf)
+                # Use the stricter of Bayes posterior boundary and high-component lower shoulder
+                # so the threshold never collapses into the background noise tail.
+                boundary = _gmm_bayes_boundary(mu_lo, sd_lo, pi_lo, mu_hi, sd_hi, pi_hi)
+                tau = max(boundary, mu_hi - 0.35 * sd_hi)
+                tau = max(self.min_threshold, min(self.max_threshold, tau))
                 self.thresholds[cls_id] = round(float(tau), 4)
 
     def threshold_for(self, cls_id: int) -> float:
@@ -344,6 +433,7 @@ class DynamicGMMThreshold:
             "base_threshold": self.base_threshold,
             "buffer_size": self.buffer_size,
             "min_samples": self.min_samples,
+            "min_score_input": self.min_score_input,
             "min_threshold": self.min_threshold,
             "max_threshold": self.max_threshold,
             "buffers": {int(c): [float(x) for x in vals] for c, vals in self.buffers.items()},

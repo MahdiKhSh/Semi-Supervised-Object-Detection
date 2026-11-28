@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import json
+import os
 from pathlib import Path
 from PIL import Image
 import torch
@@ -107,7 +108,12 @@ def image_inventory_check(annotation_file, image_dir, *, check_every_image=True)
     if len(names) != len(set(names)):
         raise ValueError("duplicate image filenames")
     candidates = names if check_every_image else names[:50]
-    missing = [name for name in candidates if not (Path(image_dir) / name).is_file()]
+    img_dir = Path(image_dir)
+    if all(("/" not in name and "\\" not in name) for name in candidates):
+        present = set(os.listdir(img_dir))
+        missing = [name for name in candidates if name not in present]
+    else:
+        missing = [name for name in candidates if not (img_dir / name).is_file()]
     if missing:
         raise FileNotFoundError(f"{len(missing)} missing images, first examples: {missing[:5]}")
     return {"count": len(names), "annotations": len(obj.get("annotations", [])), "image_directory": str(image_dir)}

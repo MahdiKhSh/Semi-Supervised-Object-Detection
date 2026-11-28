@@ -243,3 +243,212 @@ def test_q1_presets_and_strong_baselines_end_to_end(tmp_path):
             "--no-pretrained-backbone",
         ]))
         assert meta["status"] == "completed"
+
+
+def test_fasterrcnn_v2_uses_frozen_bn_and_group_norm():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("torchvision")
+    from torchvision.ops import FrozenBatchNorm2d
+    from ssod_research.native_training import build_model
+
+    m = build_model(pretrained_backbone=False, max_side=128, detector="fasterrcnn_v2")
+    active_bn = sum(1 for mod in m.modules() if isinstance(mod, torch.nn.BatchNorm2d))
+    frozen_bn = sum(1 for mod in m.backbone.body.modules() if isinstance(mod, FrozenBatchNorm2d))
+    gn_fpn = sum(1 for mod in m.backbone.fpn.modules() if isinstance(mod, torch.nn.GroupNorm))
+    gn_roi = sum(1 for mod in m.roi_heads.modules() if isinstance(mod, torch.nn.GroupNorm))
+    assert active_bn == 0
+    assert frozen_bn == 53
+    assert gn_fpn >= 8
+    assert gn_roi >= 4
+
+
+def test_eman_buffer_ema_update():
+    torch = pytest.importorskip("torch")
+    from ssod_research.native_training import ema_update
+
+    student = torch.nn.BatchNorm2d(4)
+    teacher = torch.nn.BatchNorm2d(4)
+    with torch.no_grad():
+        student.running_mean.fill_(2.0)
+        teacher.running_mean.fill_(0.0)
+        student.num_batches_tracked.fill_(10)
+        teacher.num_batches_tracked.fill_(0)
+    ema_update(teacher, student, 0.5)
+    assert torch.allclose(teacher.running_mean, torch.ones(4))
+    assert int(teacher.num_batches_tracked.item()) == 10
+
+
+def test_monotone_fp_per_gt_and_pava_precision():
+    from ssod_research.conformal import (
+        WeightedConformalRiskCalibrator,
+        _monotone_fp_per_gt_curve,
+        fit_isotonic_precision,
+    )
+
+    grid = [round(0.1 * k, 2) for k in range(1, 10)]
+    # Even with a high-score FP at 0.85, L_FPR(x; lam) is naturally non-increasing with ZERO suffix-max blowup
+    rels = [0.2, 0.4, 0.65, 0.75, 0.85, 0.92]
+    tps = [0, 0, 1, 1, 0, 1]
+    curve, counts = _monotone_fp_per_gt_curve(rels, tps, num_gt=5, grid=grid)
+    assert all(0.0 <= v <= 1.0 for v in curve)
+    assert all(curve[i] >= curve[i + 1] for i in range(len(curve) - 1))
+    assert curve[6] == pytest.approx(1.0 / 5.0)  # lam=0.7: only 1 FP (0.85) / 5 GT = 0.20!
+    assert curve[8] == 0.0  # lam=0.9: 0 FPs
+
+    # PAVA must be monotonically non-decreasing in [0, 1]
+    pava = fit_isotonic_precision(
+        [0.10, 0.12, 0.35, 0.38, 0.62, 0.65, 0.88, 0.91],
+        [0, 0, 1, 0, 1, 0, 1, 1],
+        num_bins=6,
+    )
+    assert len(pava) == 6
+    assert all(0.0 <= v <= 1.0 for v in pava)
+    assert all(pava[i] <= pava[i + 1] + 1e-9 for i in range(len(pava) - 1))
+
+    cal = WeightedConformalRiskCalibrator(num_foreground_classes=10, num_pava_bins=6)
+    cal.pava_precision["degraded"] = pava
+    st = cal.state_dict()
+    cal2 = WeightedConformalRiskCalibrator(num_foreground_classes=10, num_pava_bins=6)
+    cal2.load_state_dict(st)
+    assert cal2.pava_precision["degraded"] == pava
+    assert cal2.precision_for(0.90, "degraded") >= cal2.precision_for(0.10, "degraded")
+
+
+def test_bidirectional_probe_and_conformal_soft_negative_loss():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("torchvision")
+    from ssod_research.care_ssod import (
+        care_unsupervised_loss,
+        extract_teacher_tri_zone_targets,
+        strong_view_care,
+        teacher_bidirectional_probe,
+    )
+    from ssod_research.conformal import WeightedConformalRiskCalibrator
+    from ssod_research.native_training import build_model, target_for_training
+
+    student = build_model(pretrained_backbone=False, max_side=128, detector="fasterrcnn_v2")
+    teacher = build_model(pretrained_backbone=False, max_side=128, detector="fasterrcnn_v2")
+    student.train()
+    teacher.eval()
+    imgs = [torch.rand(3, 96, 128), torch.rand(3, 96, 128)]
+
+    probed, cache = teacher_bidirectional_probe(teacher, imgs)
+    assert len(probed) == 2 and "features" in cache
+
+    cal = WeightedConformalRiskCalibrator(num_foreground_classes=10)
+    tri, stats, t_cache = extract_teacher_tri_zone_targets(teacher, imgs, cal, return_cache=True)
+    assert len(tri) == 2 and "degradation_mean" in stats
+
+    # Force image 0 = Zone-1 + Zone-2, image 1 = Zone-2 ONLY (mixed batch!)
+    p1 = torch.full((1, 11), 0.01)
+    p1[0, 3] = 0.90
+    p2 = torch.full((1, 11), 0.02)
+    p2[0, 10] = 0.80
+    z1_0 = {
+        "boxes": torch.tensor([[16.0, 16.0, 64.0, 64.0]]),
+        "labels": torch.tensor([3], dtype=torch.long),
+        "scores": torch.tensor([0.90]),
+        "probs": p1,
+        "reliability": torch.tensor([0.86]),
+        "q_loc": torch.tensor([0.85]),
+        "p_tp": torch.tensor([0.90]),
+    }
+    z2_0 = {
+        "boxes": torch.tensor([[70.0, 20.0, 110.0, 70.0]]),
+        "labels": torch.tensor([10], dtype=torch.long),
+        "scores": torch.tensor([0.55]),
+        "probs": p2,
+        "reliability": torch.tensor([0.50]),
+        "q_loc": torch.tensor([0.70]),
+        "p_tp": torch.tensor([0.45]),
+    }
+    z1_1 = {
+        "boxes": torch.zeros((0, 4)),
+        "labels": torch.zeros((0,), dtype=torch.long),
+        "scores": torch.zeros((0,)),
+        "probs": torch.zeros((0, 11)),
+        "reliability": torch.zeros((0,)),
+        "q_loc": torch.zeros((0,)),
+        "p_tp": torch.zeros((0,)),
+    }
+    rng = random.Random(11)
+    a0, az1_0, az2_0, f0 = strong_view_care(imgs[0], z1_0, z2_0, rng=rng, return_flip=True)
+    a1, az1_1, az2_1, f1 = strong_view_care(imgs[1], z1_1, z2_0, rng=rng, return_flip=True)
+
+    loss, extra = care_unsupervised_loss(
+        student,
+        [a0, a1],
+        [target_for_training(az1_0, image_id=1), target_for_training(az1_1, image_id=2)],
+        [az1_0, az1_1],
+        [az2_0, az2_1],
+        teacher=teacher,
+        teacher_cache=t_cache,
+        flips=[f0, f1],
+    )
+    assert loss is not None and torch.isfinite(loss).item()
+    assert extra["unsup"] > 0.0 and extra["stability"] > 0.0
+    loss.backward()
+    assert student.roi_heads.box_predictor.cls_score.weight.grad.abs().sum() > 0
+    assert all(p.grad is None for p in teacher.parameters())
+
+
+def test_soft_teacher_decoupled_cls_and_reg_masks():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("torchvision")
+    from ssod_research.baselines import soft_teacher_extract, soft_teacher_unsupervised_loss
+    from ssod_research.native_training import build_model, target_for_training
+
+    student = build_model(pretrained_backbone=False, max_side=128)
+    teacher = build_model(pretrained_backbone=False, max_side=128)
+    student.train()
+    teacher.eval()
+    img = torch.rand(3, 96, 128)
+    _, _, cache = soft_teacher_extract(teacher, [img], jitter_times=2, rng=random.Random(1))
+
+    pseudo = {
+        "boxes": torch.tensor([[16.0, 16.0, 60.0, 60.0], [64.0, 20.0, 110.0, 75.0]]),
+        "labels": torch.tensor([3, 1], dtype=torch.long),
+        "scores": torch.tensor([0.55, 0.90]),
+        "cls_valid": torch.tensor([False, True]),
+        "reg_valid": torch.tensor([True, False]),
+    }
+    target = target_for_training(pseudo, image_id=1)
+    loss, _ = soft_teacher_unsupervised_loss(
+        student, teacher, [img], [target], [False], [pseudo["reg_valid"]], cache,
+        cls_valid_list=[pseudo["cls_valid"]],
+    )
+    assert loss is not None and torch.isfinite(loss).item()
+    loss.backward()
+    assert student.roi_heads.box_predictor.bbox_pred.weight.grad.abs().sum() > 0
+
+
+def test_warmup_constant_scheduler_and_diagnostic_partial_report(tmp_path):
+    torch = pytest.importorskip("torch")
+    from report_results import write_report
+    from ssod_research.native_training import build_scheduler
+
+    opt = torch.optim.SGD([torch.nn.Parameter(torch.zeros(2))], lr=0.01)
+    sched = build_scheduler(opt, schedule="warmup_constant", total_steps=10, warmup_steps=3)
+    lrs = []
+    for _ in range(10):
+        lrs.append(opt.param_groups[0]["lr"])
+        opt.step()
+        sched.step()
+    assert lrs[0] == pytest.approx(0.001)
+    assert lrs[3] == pytest.approx(0.01)
+    assert lrs[-1] == pytest.approx(0.01)
+
+    csv_path = tmp_path / "results.csv"
+    csv_path.write_text(
+        "experiment,variant,seed,final_step,AP,AP50,AP75,AP_small,partial_validation,elapsed_seconds\n"
+        "10pct_s42/supervised,supervised,42,3000,0.1800,0.3400,0.1600,0.0600,True,1000\n"
+        "10pct_s42/core_ssod,core_ssod,42,3000,0.2050,0.3800,0.1850,0.0750,True,1400\n",
+        encoding="utf8",
+    )
+    pkg = write_report(csv_path, tmp_path)
+    assert pkg["completed_run_rows"] == 0
+    assert pkg["diagnostic_partial_rows"] == 2
+    md = (tmp_path / "PAPER_RESULTS.md").read_text(encoding="utf8")
+    assert "Diagnostic Partial-Validation Summary" in md
+    assert "+0.0250" in md
+

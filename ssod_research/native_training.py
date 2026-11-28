@@ -18,6 +18,7 @@ Crash-safety guarantees:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import contextlib
 import copy
 from datetime import datetime, timezone
@@ -35,7 +36,7 @@ import torch
 import torchvision
 from torchvision.models import ResNet50_Weights
 from torchvision.models.detection import fasterrcnn_resnet50_fpn, fasterrcnn_resnet50_fpn_v2
-from torchvision.ops import box_iou
+from torchvision.ops import FrozenBatchNorm2d, box_iou
 
 from ssod_research.baselines import (
     DynamicGMMThreshold,
@@ -142,21 +143,84 @@ def resolve_amp(amp: str, device: torch.device) -> tuple[str, bool, torch.dtype 
     return "fp16", True, torch.float16
 
 
+def _replace_bn_with_frozen_bn(module: torch.nn.Module) -> int:
+    """Recursively convert nn.BatchNorm2d -> FrozenBatchNorm2d preserving pretrained stats."""
+    replaced = 0
+    for name, child in list(module.named_children()):
+        if isinstance(child, torch.nn.BatchNorm2d):
+            fbn = FrozenBatchNorm2d(child.num_features, eps=child.eps)
+            with torch.no_grad():
+                if child.weight is not None:
+                    fbn.weight.copy_(child.weight.detach())
+                if child.bias is not None:
+                    fbn.bias.copy_(child.bias.detach())
+                if child.running_mean is not None:
+                    fbn.running_mean.copy_(child.running_mean.detach())
+                if child.running_var is not None:
+                    fbn.running_var.copy_(child.running_var.detach())
+            setattr(module, name, fbn)
+            replaced += 1
+        else:
+            replaced += _replace_bn_with_frozen_bn(child)
+    return replaced
+
+
+def _replace_bn_with_group_norm(module: torch.nn.Module, max_groups: int = 32) -> int:
+    """Recursively convert nn.BatchNorm2d -> nn.GroupNorm (batch-size invariant, Wu & He ECCV'18)."""
+    replaced = 0
+    for name, child in list(module.named_children()):
+        if isinstance(child, torch.nn.BatchNorm2d):
+            n_ch = int(child.num_features)
+            n_grp = math.gcd(int(max_groups), n_ch)
+            gn = torch.nn.GroupNorm(num_groups=max(1, n_grp), num_channels=n_ch, eps=child.eps, affine=child.affine)
+            with torch.no_grad():
+                if child.affine and child.weight is not None and child.bias is not None:
+                    gn.weight.copy_(child.weight.detach())
+                    gn.bias.copy_(child.bias.detach())
+            setattr(module, name, gn)
+            replaced += 1
+        else:
+            replaced += _replace_bn_with_group_norm(child, max_groups=max_groups)
+    return replaced
+
+
+def _convert_v2_norm_layers(model: torch.nn.Module) -> tuple[int, int]:
+    """Eliminate micro-batch BN corruption & EMA-buffer mismatch in FasterRCNN-v2.
+
+    - Backbone body (pretrained ImageNet-V2 ResNet50): BatchNorm2d -> FrozenBatchNorm2d
+      preserving exact pretrained running statistics (matching v1/Detectron2 best practice).
+    - FPN, RPN, and RoI heads (randomly initialized): BatchNorm2d -> GroupNorm(32, C)
+      making micro-batch sizes (Kaggle 2x4 vs RTX 5090 4x2) mathematically invariant.
+    """
+    n_fbn = _replace_bn_with_frozen_bn(model.backbone.body)
+    n_gn = 0
+    if hasattr(model.backbone, "fpn"):
+        n_gn += _replace_bn_with_group_norm(model.backbone.fpn)
+    if hasattr(model, "rpn"):
+        n_gn += _replace_bn_with_group_norm(model.rpn)
+    if hasattr(model, "roi_heads"):
+        n_gn += _replace_bn_with_group_norm(model.roi_heads)
+    return n_fbn, n_gn
+
+
 def build_model(*, pretrained_backbone, max_side, min_size=None, detector="fasterrcnn_v1"):
     """Same backbone and detector hyperparameters across all variants."""
     size = int(min_size or max_side)
     if detector == "fasterrcnn_v2":
         backbone_weights = ResNet50_Weights.IMAGENET1K_V2 if pretrained_backbone else None
+        extra_kw = {"trainable_backbone_layers": 3} if backbone_weights is not None else {}
         model = fasterrcnn_resnet50_fpn_v2(
             weights=None, weights_backbone=backbone_weights,
             num_classes=len(BDD_CLASSES), min_size=size, max_size=int(max_side),
-            box_detections_per_img=100, trainable_backbone_layers=3)
+            box_detections_per_img=100, **extra_kw)
+        _convert_v2_norm_layers(model)
     else:
         backbone_weights = ResNet50_Weights.IMAGENET1K_V1 if pretrained_backbone else None
+        extra_kw = {"trainable_backbone_layers": 3} if backbone_weights is not None else {}
         model = fasterrcnn_resnet50_fpn(
             weights=None, weights_backbone=backbone_weights,
             num_classes=len(BDD_CLASSES), min_size=size, max_size=int(max_side),
-            box_detections_per_img=100, trainable_backbone_layers=3)
+            box_detections_per_img=100, **extra_kw)
     # TorchVision ignores trainable_backbone_layers without pretrained weights.
     # Fix the unfrozen-stage set after a no-download supervised warm start so
     # all variants actually train the SAME backbone layers.
@@ -169,9 +233,15 @@ def build_model(*, pretrained_backbone, max_side, min_size=None, detector="faste
 def build_scheduler(optimizer, *, schedule: str, total_steps: int, warmup_steps: int = 0):
     total = max(1, int(total_steps))
     wu = max(0, min(int(warmup_steps), total - 1)) if total > 1 else 0
+    base_lr = float(optimizer.param_groups[0]["lr"]) if optimizer.param_groups else 0.0
+    eta_min = base_lr * 0.01
+    if schedule == "warmup_constant" and wu > 0:
+        w = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=wu)
+        c = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0, total_iters=0)
+        return torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[w, c], milestones=[wu])
     if schedule == "warmup_cosine" and wu > 0:
         w = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=wu)
-        c = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, total - wu), eta_min=0.0)
+        c = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, total - wu), eta_min=eta_min)
         return torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[w, c], milestones=[wu])
     if schedule == "warmup_multistep" and wu > 0:
         w = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=wu)
@@ -181,12 +251,29 @@ def build_scheduler(optimizer, *, schedule: str, total_steps: int, warmup_steps:
         ms = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[m1, m2], gamma=0.1)
         return torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[w, ms], milestones=[wu])
     if schedule in ("cosine", "warmup_cosine"):
-        return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total, eta_min=0.0)
+        return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total, eta_min=eta_min)
     if schedule in ("multistep", "warmup_multistep"):
         m1 = max(1, int(round(0.65 * total)))
         m2 = max(m1 + 1, int(round(0.85 * total)))
         return torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[m1, m2], gamma=0.1)
     return torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0, total_iters=0)
+
+
+def _weak_flip_sample(img: torch.Tensor, target: dict, flip: bool):
+    """Exact weak horizontal flip for supervised training batches."""
+    if not flip:
+        return img, target
+    flipped_img = torch.flip(img, dims=(-1,))
+    w = int(flipped_img.shape[-1])
+    boxes = target["boxes"].clone()
+    if len(boxes):
+        old_x1 = boxes[:, 0].clone()
+        old_x2 = boxes[:, 2].clone()
+        boxes[:, 0] = w - old_x2
+        boxes[:, 2] = w - old_x1
+    flipped_target = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in target.items()}
+    flipped_target["boxes"] = boxes
+    return flipped_img, flipped_target
 
 
 def portable_targets(batch, device):
@@ -205,11 +292,16 @@ def sample_indices(size, n, seed, step, stream_id):
 
 
 def ema_update(teacher, student, decay):
+    """EMAN (Cai et al., CVPR 2021): EMA both parameters and floating-point buffers."""
     with torch.no_grad():
         for a, b in zip(teacher.parameters(), student.parameters()):
-            a.mul_(decay).add_(b.detach(), alpha=1 - decay)
+            a.mul_(decay).add_(b.detach(), alpha=1.0 - decay)
         for a, b in zip(teacher.buffers(), student.buffers()):
-            a.copy_(b)
+            if a.is_floating_point():
+                if not torch.equal(a, b):
+                    a.mul_(decay).add_(b.detach(), alpha=1.0 - decay)
+            else:
+                a.copy_(b)
 
 
 def training_attributes(root):
@@ -379,6 +471,8 @@ def evaluate(
     eval_fingerprint: str | None = None,
     resume_partial: bool = True,
     stop_after_images: int | None = None,
+    amp_dtype: torch.dtype | None = None,
+    batch_size: int | None = None,
 ):
     """Resumable COCO AP on original-image coordinates using pycocotools.
 
@@ -421,49 +515,75 @@ def evaluate(
             if row.get("eval_key") == expected_key and "image_id" in row:
                 completed_by_id[int(row["image_id"])] = list(row.get("preds") or [])
 
-    id_set = []
+    id_set = [int(val_data.images[i]["id"]) for i in range(total_n)]
+    pending_indices = [i for i in range(total_n) if int(val_data.images[i]["id"]) not in completed_by_id]
+
+    bs = int(batch_size) if batch_size is not None else (8 if device.type == "cuda" else 1)
+    bs = max(1, bs)
+    autocast_ctx = (
+        torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=True)
+        if (device.type == "cuda" and amp_dtype is not None)
+        else contextlib.nullcontext()
+    )
+    n_workers = min(6, max(2, os.cpu_count() or 4)) if (device.type == "cuda" and bs > 1) else 0
+    eval_pool = ThreadPoolExecutor(max_workers=n_workers) if n_workers > 0 else None
+
     started = time.monotonic()
     processed_this_call = 0
-    with torch.inference_mode():
-        for i in range(total_n):
-            info = val_data.images[i]
-            sample_id = int(info["id"])
-            id_set.append(sample_id)
-            if sample_id in completed_by_id:
-                continue
-            if stop_after_images is not None and processed_this_call >= int(stop_after_images):
-                raise InterruptedError(f"Evaluation interrupted after {processed_this_call} new images")
-            img, target = val_data[i]
-            sample_id = int(target["image_id"].item())
-            original = gt.imgs[sample_id]
-            scaled_h, scaled_w = img.shape[-2:]
-            output = model([img.to(device)])[0]
-            img_preds = []
-            for box, score, label in zip(output["boxes"].detach().cpu().tolist(),
-                                         output["scores"].detach().cpu().tolist(),
-                                         output["labels"].detach().cpu().tolist()):
-                if not 1 <= int(label) < len(BDD_CLASSES):
-                    continue
-                x1, y1, x2, y2 = box
-                sx = float(original["width"]) / scaled_w
-                sy = float(original["height"]) / scaled_h
-                x1, x2 = max(0.0, x1 * sx), min(float(original["width"]), x2 * sx)
-                y1, y2 = max(0.0, y1 * sy), min(float(original["height"]), y2 * sy)
-                if x2 <= x1 or y2 <= y1:
-                    continue
-                img_preds.append({
-                    "image_id": sample_id,
-                    "category_id": int(label),
-                    "bbox": [x1, y1, x2 - x1, y2 - y1],
-                    "score": float(score),
-                })
-            completed_by_id[sample_id] = img_preds
-            append_jsonl(partial_path, {
-                "eval_key": expected_key,
-                "image_id": sample_id,
-                "preds": img_preds,
-            })
-            processed_this_call += 1
+    pos = 0
+    try:
+        with torch.inference_mode():
+            while pos < len(pending_indices):
+                if stop_after_images is not None and processed_this_call >= int(stop_after_images):
+                    raise InterruptedError(f"Evaluation interrupted after {processed_this_call} new images")
+                take = bs
+                if stop_after_images is not None:
+                    take = min(take, max(1, int(stop_after_images) - processed_this_call))
+                chunk = pending_indices[pos:pos + take]
+                pos += len(chunk)
+
+                if eval_pool is not None and len(chunk) > 1:
+                    samples = list(eval_pool.map(val_data.__getitem__, chunk))
+                else:
+                    samples = [val_data[i] for i in chunk]
+
+                imgs_dev = [im.to(device) for im, _ in samples]
+                with autocast_ctx:
+                    outputs = model(imgs_dev)
+
+                for (img, target), output in zip(samples, outputs):
+                    sample_id = int(target["image_id"].item())
+                    original = gt.imgs[sample_id]
+                    scaled_h, scaled_w = img.shape[-2:]
+                    img_preds = []
+                    for box, score, label in zip(output["boxes"].detach().cpu().tolist(),
+                                                 output["scores"].detach().cpu().tolist(),
+                                                 output["labels"].detach().cpu().tolist()):
+                        if not 1 <= int(label) < len(BDD_CLASSES):
+                            continue
+                        x1, y1, x2, y2 = box
+                        sx = float(original["width"]) / scaled_w
+                        sy = float(original["height"]) / scaled_h
+                        x1, x2 = max(0.0, x1 * sx), min(float(original["width"]), x2 * sx)
+                        y1, y2 = max(0.0, y1 * sy), min(float(original["height"]), y2 * sy)
+                        if x2 <= x1 or y2 <= y1:
+                            continue
+                        img_preds.append({
+                            "image_id": sample_id,
+                            "category_id": int(label),
+                            "bbox": [x1, y1, x2 - x1, y2 - y1],
+                            "score": float(score),
+                        })
+                    completed_by_id[sample_id] = img_preds
+                    append_jsonl(partial_path, {
+                        "eval_key": expected_key,
+                        "image_id": sample_id,
+                        "preds": img_preds,
+                    })
+                    processed_this_call += 1
+    finally:
+        if eval_pool is not None:
+            eval_pool.shutdown(wait=True)
 
     predictions = []
     for sample_id in id_set:
@@ -596,7 +716,7 @@ def parse_args(argv=None):
     p.add_argument(
         "--lr-schedule",
         default="constant",
-        choices=("constant", "multistep", "cosine", "warmup_cosine", "warmup_multistep"),
+        choices=("constant", "multistep", "cosine", "warmup_constant", "warmup_cosine", "warmup_multistep"),
     )
     p.add_argument("--lr-warmup-steps", type=int, default=0)
     p.add_argument("--ema", type=float, default=0.999)
@@ -608,6 +728,8 @@ def parse_args(argv=None):
     p.add_argument("--adaptive-strength", type=float, default=0.12)
     p.add_argument("--condition-offset", type=float, default=0.05)
     p.add_argument("--unsup-weight", type=float, default=1.0)
+    p.add_argument("--unsup-warmup-steps", type=int, default=0,
+                   help="Linearly ramp unsupervised loss weight from 0 -> unsup_weight over N steps.")
     p.add_argument("--consistency-weight", type=float, default=0.25)
     p.add_argument("--box-weight", type=float, default=1.0)
     p.add_argument("--class-weight", type=float, default=1.0)
@@ -616,12 +738,12 @@ def parse_args(argv=None):
     p.add_argument("--care-nwd", type=int, choices=(0, 1), default=1)
     p.add_argument("--care-visibility-cal", type=int, choices=(0, 1), default=1)
     p.add_argument("--care-cutout", type=int, choices=(0, 1), default=1)
-    p.add_argument("--care-giou-weight", type=float, default=0.5)
-    p.add_argument("--care-kl-z1-weight", type=float, default=0.5)
-    p.add_argument("--care-kl-z2-weight", type=float, default=0.35)
-    p.add_argument("--care-temperature", type=float, default=2.0)
-    p.add_argument("--conformal-alpha-strict", type=float, default=0.15)
-    p.add_argument("--conformal-alpha-loose", type=float, default=0.40)
+    p.add_argument("--care-giou-weight", type=float, default=0.25)
+    p.add_argument("--care-kl-z1-weight", type=float, default=0.15)
+    p.add_argument("--care-kl-z2-weight", type=float, default=0.05)
+    p.add_argument("--care-temperature", type=float, default=1.5)
+    p.add_argument("--conformal-alpha-strict", type=float, default=0.08)
+    p.add_argument("--conformal-alpha-loose", type=float, default=0.30)
     p.add_argument("--conformal-every", type=int, default=250)
     p.add_argument("--conformal-cal-fraction", type=float, default=0.08)
     p.add_argument("--conformal-max-cal", type=int, default=256)
@@ -650,7 +772,7 @@ def parse_args(argv=None):
         value = getattr(args, name)
         if not 0 <= value <= 1:
             p.error(f"{name} must be in [0,1]")
-    for name in ("lr", "unsup_weight", "consistency_weight", "localization_scale",
+    for name in ("lr", "unsup_weight", "unsup_warmup_steps", "consistency_weight", "localization_scale",
                  "adaptive_strength", "box_weight", "class_weight", "confidence_weight"):
         if getattr(args, name) < 0:
             p.error(f"{name} must be nonnegative")
@@ -1092,6 +1214,7 @@ def _train_locked(args, out: Path):
                 max_images=args.eval_max_images or None,
                 eval_fingerprint=eval_fp,
                 resume_partial=True,
+                amp_dtype=(dtype if autocast_enabled else None),
             )
         finally:
             restore_rng_state(saved_rng, device.type)
@@ -1102,6 +1225,9 @@ def _train_locked(args, out: Path):
             append_jsonl(eval_log, metrics_row)
         print("EVAL", json.dumps(metrics_row), flush=True)
         return metrics_row
+
+    grad_accum = max(1, int(getattr(args, "grad_accum_steps", 1)))
+    eff_batch = int(args.batch_size) * grad_accum
 
     def _run_conformal_calibration(step_num: int):
         if conformal_calibrator is None or teacher is None or not cal_labeled_ids:
@@ -1115,6 +1241,8 @@ def _train_locked(args, out: Path):
                 device,
                 step=step_num,
                 max_samples=int(args.conformal_max_cal),
+                batch_size=max(1, min(8, eff_batch)),
+                amp_dtype=(dtype if autocast_enabled else None),
                 use_nwd=bool(args.care_nwd),
             )
         finally:
@@ -1123,22 +1251,53 @@ def _train_locked(args, out: Path):
         print("CONFORMAL", json.dumps(diag), flush=True)
         return diag
 
-    grad_accum = max(1, int(getattr(args, "grad_accum_steps", 1)))
-    eff_batch = int(args.batch_size) * grad_accum
-
     if conformal_calibrator is not None and conformal_calibrator.calibration_count == 0 and start < args.steps:
         _run_conformal_calibration(start)
 
+    io_pool = (
+        ThreadPoolExecutor(max_workers=min(6, max(2, os.cpu_count() or 4)))
+        if device.type == "cuda"
+        else None
+    )
+
+    def _prefetch_step(step_idx: int):
+        sup_slots = sample_indices(len(train_labeled_ids), eff_batch, args.seed, step_idx, 0)
+        sup_ids = [train_labeled_ids[idx] for idx in sup_slots]
+        u_ids = (
+            sample_indices(len(unlabeled), eff_batch, args.seed, step_idx, 1)
+            if teacher is not None else []
+        )
+        if io_pool is not None:
+            sup_futs = [io_pool.submit(labeled.__getitem__, idx) for idx in sup_ids]
+            u_futs = [io_pool.submit(unlabeled.__getitem__, idx) for idx in u_ids] if u_ids else []
+            return sup_ids, u_ids, sup_futs, u_futs
+        return sup_ids, u_ids, None, None
+
     steps_this_call = 0
+    prefetched = _prefetch_step(start) if start < args.steps else None
     try:
         for step in range(start, args.steps):
             model.train()
             optimizer.zero_grad(set_to_none=True)
-            sup_all_slots = sample_indices(len(train_labeled_ids), eff_batch, args.seed, step, 0)
-            u_all_ids = (
-                sample_indices(len(unlabeled), eff_batch, args.seed, step, 1)
-                if teacher is not None else []
+
+            assert prefetched is not None
+            sup_all_ids, u_all_ids, sup_futs, u_futs = prefetched
+            if sup_futs is not None:
+                sup_step_data = [f.result() for f in sup_futs]
+                u_step_data = [f.result() for f in u_futs] if u_futs else []
+            else:
+                sup_step_data = cpu_batch(labeled, sup_all_ids)
+                u_step_data = cpu_batch(unlabeled, u_all_ids) if u_all_ids else []
+
+            # Overlap PIL decode/resize of step+1 with GPU forward+backward of current step
+            prefetched = _prefetch_step(step + 1) if (step + 1) < args.steps else None
+
+            unsup_ramp = (
+                min(1.0, float(step + 1) / float(args.unsup_warmup_steps))
+                if int(args.unsup_warmup_steps) > 0
+                else 1.0
             )
+            eff_unsup_weight = float(args.unsup_weight) * unsup_ramp
 
             step_loss_sum = 0.0
             sup_sum = 0.0
@@ -1148,11 +1307,17 @@ def _train_locked(args, out: Path):
                 "sup": 0.0, "unsup": 0.0, "stability": 0.0,
                 "candidates": 0, "accepted": 0,
             }
+            if teacher is not None and int(args.unsup_warmup_steps) > 0:
+                extra["unsup_w"] = round(eff_unsup_weight, 4)
 
             for micro in range(grad_accum):
                 sl = slice(micro * args.batch_size, (micro + 1) * args.batch_size)
-                selection = [train_labeled_ids[idx] for idx in sup_all_slots[sl]]
-                train_batch = cpu_batch(labeled, selection)
+                raw_train_batch = sup_step_data[sl]
+                train_batch = []
+                for b_idx, (img_cpu, tgt_cpu) in enumerate(raw_train_batch):
+                    slot_idx = micro * args.batch_size + b_idx
+                    rng_sup = random.Random(args.seed * 5381 + step * 97 + slot_idx * 13 + 1)
+                    train_batch.append(_weak_flip_sample(img_cpu, tgt_cpu, rng_sup.random() < 0.5))
                 images = [img.to(device) for img, _ in train_batch]
                 targets = portable_targets(train_batch, device)
 
@@ -1164,24 +1329,26 @@ def _train_locked(args, out: Path):
 
                 if teacher is not None:
                     ids = u_all_ids[sl]
-                    batch_u = cpu_batch(unlabeled, ids)
+                    batch_u = u_step_data[sl]
                     originals = [img.to(device) for img, _ in batch_u]
-                    rng = random.Random(args.seed * 7103 + step * 61 + micro * 17 + 3)
+                    rng_micro = random.Random(args.seed * 7103 + step * 61 + micro * 17 + 3)
 
                     if args.variant in ("care_ssod", "core_ssod"):
                         active_cal = conformal_calibrator if args.variant == "core_ssod" else care_calibrator
-                        tri_outputs, statistics = extract_teacher_tri_zone_targets(
-                            teacher,
-                            originals,
-                            active_cal,
-                            use_nwd=bool(args.care_nwd),
-                            use_visibility_calibration=(
-                                bool(args.conformal_vis_weight)
-                                if args.variant == "core_ssod"
-                                else bool(args.care_visibility_cal)
-                            ),
-                            use_tri_zone=bool(args.care_tri_zone),
-                        )
+                        with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
+                            tri_outputs, statistics, t_cache = extract_teacher_tri_zone_targets(
+                                teacher,
+                                originals,
+                                active_cal,
+                                use_nwd=bool(args.care_nwd),
+                                use_visibility_calibration=(
+                                    bool(args.conformal_vis_weight)
+                                    if args.variant == "core_ssod"
+                                    else bool(args.care_visibility_cal)
+                                ),
+                                use_tri_zone=bool(args.care_tri_zone),
+                                return_cache=True,
+                            )
                         extra["candidates"] += int(statistics.get("candidates", 0))
                         extra["accepted"] += int(statistics.get("accepted", 0))
                         extra["zone1_count"] = int(extra.get("zone1_count", 0)) + int(statistics.get("zone1_count", 0))
@@ -1191,16 +1358,20 @@ def _train_locked(args, out: Path):
                         running_stats["total_accepted"] += int(statistics.get("accepted", 0))
                         running_stats["total_quality_sum"] += float(statistics.get("quality_sum", 0.0))
 
-                        aug_images, z1_targets, z1_meta, z2_meta = [], [], [], []
-                        for img, (_, target), item in zip(originals, batch_u, tri_outputs):
-                            a_img, a_z1, a_z2 = strong_view_care(
+                        aug_images, z1_targets, z1_meta, z2_meta, flips = [], [], [], [], []
+                        for b_idx, (img, (_, target), item) in enumerate(zip(originals, batch_u, tri_outputs)):
+                            slot_idx = micro * args.batch_size + b_idx
+                            img_rng = random.Random(args.seed * 7103 + step * 61 + slot_idx * 17 + 3)
+                            a_img, a_z1, a_z2, was_flipped = strong_view_care(
                                 img, item["zone1"], item["zone2"],
-                                rng=rng, enable_cutout=bool(args.care_cutout),
+                                rng=img_rng, enable_cutout=bool(args.care_cutout),
+                                return_flip=True,
                             )
                             aug_images.append(a_img)
                             z1_targets.append(target_for_training(a_z1, image_id=int(target["image_id"])))
                             z1_meta.append(a_z1)
                             z2_meta.append(a_z2)
+                            flips.append(was_flipped)
 
                         with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
                             care_loss, care_extra = care_unsupervised_loss(
@@ -1209,57 +1380,73 @@ def _train_locked(args, out: Path):
                                 z1_targets,
                                 z1_meta,
                                 z2_meta,
+                                teacher=teacher,
+                                teacher_cache=t_cache,
+                                flips=flips,
                                 use_tri_zone=bool(args.care_tri_zone),
                                 giou_weight=float(args.care_giou_weight),
                                 kl_zone1_weight=float(args.care_kl_z1_weight),
                                 kl_zone2_weight=float(args.care_kl_z2_weight),
                                 temperature=float(args.care_temperature),
                             )
-                            if care_loss is not None:
-                                micro_total = micro_total + args.unsup_weight * care_loss
+                            if care_loss is not None and eff_unsup_weight > 0.0:
+                                micro_total = micro_total + eff_unsup_weight * care_loss
                             unsup_sum += float(care_extra.get("unsup", 0.0)) / grad_accum
                             stab_sum += float(care_extra.get("stability", 0.0)) / grad_accum
                             extra["suppressed_bg"] = int(extra.get("suppressed_bg", 0)) + int(care_extra.get("suppressed_bg", 0))
 
                     elif args.variant == "soft_teacher":
-                        st_pseudo, statistics, t_cache = soft_teacher_extract(
-                            teacher,
-                            originals,
-                            cls_threshold=float(args.pseudo_threshold),
-                            rng=rng,
-                        )
+                        with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
+                            st_pseudo, statistics, t_cache = soft_teacher_extract(
+                                teacher,
+                                originals,
+                                cls_threshold=float(args.pseudo_threshold),
+                                rng=rng_micro,
+                            )
                         extra["candidates"] += int(statistics.get("candidates", 0))
                         extra["accepted"] += int(statistics.get("accepted", 0))
                         running_stats["total_candidates"] += int(statistics.get("candidates", 0))
                         running_stats["total_accepted"] += int(statistics.get("accepted", 0))
                         running_stats["total_quality_sum"] += float(statistics.get("quality_sum", 0.0))
 
-                        aug_images, aug_targets, flips, reg_valid_list = [], [], [], []
-                        for img, (_, target), p in zip(originals, batch_u, st_pseudo):
-                            flip = rng.random() < 0.5
-                            brightness = rng.uniform(0.70, 1.30)
-                            contrast = rng.uniform(0.70, 1.30)
+                        aug_images, aug_targets, flips, cls_valid_list, reg_valid_list = [], [], [], [], []
+                        for b_idx, (img, (_, target), p) in enumerate(zip(originals, batch_u, st_pseudo)):
+                            slot_idx = micro * args.batch_size + b_idx
+                            img_rng = random.Random(args.seed * 7103 + step * 61 + slot_idx * 17 + 5)
+                            flip = img_rng.random() < 0.5
+                            brightness = img_rng.uniform(0.75, 1.25)
+                            contrast = img_rng.uniform(0.75, 1.25)
                             pt = target_for_training(p, image_id=int(target["image_id"]))
                             a_img, trans = strong_view(img, pt, flip=flip, brightness=brightness, contrast=contrast)
                             aug_images.append(a_img)
                             aug_targets.append(target_for_training(trans, image_id=int(target["image_id"])))
                             flips.append(flip)
+                            cls_valid_list.append(p["cls_valid"])
                             reg_valid_list.append(p["reg_valid"])
 
                         with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
                             st_loss, st_extra = soft_teacher_unsupervised_loss(
-                                model, teacher, aug_images, aug_targets, flips, reg_valid_list, t_cache
+                                model,
+                                teacher,
+                                aug_images,
+                                aug_targets,
+                                flips,
+                                reg_valid_list,
+                                t_cache,
+                                cls_valid_list=cls_valid_list,
                             )
-                            if st_loss is not None:
-                                micro_total = micro_total + args.unsup_weight * st_loss
+                            if st_loss is not None and eff_unsup_weight > 0.0:
+                                micro_total = micro_total + eff_unsup_weight * st_loss
                             unsup_sum += float(st_extra.get("unsup", 0.0)) / grad_accum
 
                     elif args.variant == "consistent_teacher":
                         teacher.eval()
-                        with torch.no_grad():
+                        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
                             raw_preds = teacher(originals)
                         aug_images, aug_targets = [], []
-                        for img, (_, target), pred in zip(originals, batch_u, raw_preds):
+                        for b_idx, (img, (_, target), pred) in enumerate(zip(originals, batch_u, raw_preds)):
+                            slot_idx = micro * args.batch_size + b_idx
+                            img_rng = random.Random(args.seed * 7103 + step * 61 + slot_idx * 17 + 7)
                             scores = pred["scores"]
                             labels = pred["labels"]
                             boxes = pred["boxes"]
@@ -1285,25 +1472,27 @@ def _train_locked(args, out: Path):
                                     "scores": scores.new_zeros((0,)),
                                 }
                             empty_z2 = {"boxes": boxes.new_zeros((0, 4))}
-                            a_img, a_z1, _ = strong_view_care(img, z1, empty_z2, rng=rng, enable_cutout=True)
+                            a_img, a_z1, _ = strong_view_care(img, z1, empty_z2, rng=img_rng, enable_cutout=True)
                             aug_images.append(a_img)
                             aug_targets.append(target_for_training(a_z1, image_id=int(target["image_id"])))
                         if any(len(t["boxes"]) > 0 for t in aug_targets):
                             with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
                                 unsup_losses = model(aug_images, aug_targets)
                                 unsupervised = sum(unsup_losses.values())
-                                micro_total = micro_total + args.unsup_weight * unsupervised
+                                if eff_unsup_weight > 0.0:
+                                    micro_total = micro_total + eff_unsup_weight * unsupervised
                                 unsup_sum += float(unsupervised.detach()) / grad_accum
 
                     else:
                         attributes = [attrs.get(unlabeled.images[idx]["file_name"], {}) for idx in ids]
-                        pseudo, statistics = pseudo_targets(
-                            teacher, originals, variant=args.variant, threshold=args.pseudo_threshold,
-                            min_quality=args.min_quality, localization_scale=args.localization_scale,
-                            agreement_iou=args.agreement_iou, counts=counts,
-                            localization_enabled=bool(args.localization_enabled),
-                            adaptive_strength=args.adaptive_strength, attrs_list=attributes,
-                            condition_offset=args.condition_offset)
+                        with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
+                            pseudo, statistics = pseudo_targets(
+                                teacher, originals, variant=args.variant, threshold=args.pseudo_threshold,
+                                min_quality=args.min_quality, localization_scale=args.localization_scale,
+                                agreement_iou=args.agreement_iou, counts=counts,
+                                localization_enabled=bool(args.localization_enabled),
+                                adaptive_strength=args.adaptive_strength, attrs_list=attributes,
+                                condition_offset=args.condition_offset)
                         extra["candidates"] += int(statistics.get("candidates", 0))
                         extra["accepted"] += int(statistics.get("accepted", 0))
                         extra["quality_sum"] = float(extra.get("quality_sum", 0.0)) + float(statistics.get("quality_sum", 0.0))
@@ -1312,10 +1501,12 @@ def _train_locked(args, out: Path):
                         running_stats["total_quality_sum"] += float(statistics.get("quality_sum", 0.0))
 
                         augmented = []
-                        for img, (_, target), p in zip(originals, batch_u, pseudo):
-                            flip = rng.random() < 0.5
-                            brightness = rng.uniform(0.75, 1.25)
-                            contrast = rng.uniform(0.75, 1.25)
+                        for b_idx, (img, (_, target), p) in enumerate(zip(originals, batch_u, pseudo)):
+                            slot_idx = micro * args.batch_size + b_idx
+                            img_rng = random.Random(args.seed * 7103 + step * 61 + slot_idx * 17 + 9)
+                            flip = img_rng.random() < 0.5
+                            brightness = img_rng.uniform(0.75, 1.25)
+                            contrast = img_rng.uniform(0.75, 1.25)
                             pseudo_target = target_for_training(p, image_id=int(target["image_id"]))
                             img, trans = strong_view(img, pseudo_target, flip=flip,
                                                      brightness=brightness, contrast=contrast)
@@ -1329,7 +1520,8 @@ def _train_locked(args, out: Path):
                             with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
                                 unsup_losses = model(aug_images, aug_targets)
                                 unsupervised = sum(unsup_losses.values())
-                                micro_total = micro_total + args.unsup_weight * unsupervised
+                                if eff_unsup_weight > 0.0:
+                                    micro_total = micro_total + eff_unsup_weight * unsupervised
                                 unsup_sum += float(unsupervised.detach()) / grad_accum
                                 if args.variant == "full" and args.consistency_weight:
                                     stability = consistency_roi_loss(
@@ -1339,7 +1531,7 @@ def _train_locked(args, out: Path):
                                         reliability_scale=args.localization_scale)
                                     if stability:
                                         stab_total = sum(stability.values())
-                                        micro_total = micro_total + args.consistency_weight * stab_total
+                                        micro_total = micro_total + args.consistency_weight * unsup_ramp * stab_total
                                         stab_sum += float(stab_total.detach()) / grad_accum
 
                 if not torch.isfinite(micro_total):
@@ -1467,6 +1659,8 @@ def _train_locked(args, out: Path):
                 )
         raise
     finally:
+        if io_pool is not None:
+            io_pool.shutdown(wait=True)
         if prev_sigint is not None:
             with contextlib.suppress(ValueError):
                 signal.signal(signal.SIGINT, prev_sigint)

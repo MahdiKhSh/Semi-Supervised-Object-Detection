@@ -30,6 +30,16 @@ def load_rows(path):
             and str(r.get("partial_validation", "")).lower() not in ("true", "1")]
 
 
+def load_partial_rows(path):
+    """Load diagnostic partial-validation rows separately (NEVER mixed into paper stats)."""
+    if not Path(path).is_file():
+        return []
+    with Path(path).open(encoding="utf8", newline="") as f:
+        rows = list(csv.DictReader(f))
+    return [r for r in rows if r.get("AP") not in (None, "", "None")
+            and str(r.get("partial_validation", "")).lower() in ("true", "1")]
+
+
 def stats_for_rows(rows):
     groups = defaultdict(list)
     paired = defaultdict(dict)
@@ -90,14 +100,22 @@ def write_report(source, output):
     source = Path(source)
     output = Path(output)
     rows = load_rows(source)
+    partial_rows = load_partial_rows(source)
     summary, comparisons = stats_for_rows(rows)
+    diag_summary, diag_comparisons = stats_for_rows(partial_rows) if partial_rows else ([], [])
     output.mkdir(parents=True, exist_ok=True)
-    package = {"completed_run_rows": len(rows), "summary": summary,
-               "paired_comparisons": comparisons,
-               "note": "Synthetic or partial validation results are diagnostics, not paper outcomes."}
+    package = {
+        "completed_run_rows": len(rows),
+        "summary": summary,
+        "paired_comparisons": comparisons,
+        "diagnostic_partial_rows": len(partial_rows),
+        "diagnostic_partial_summary": diag_summary,
+        "diagnostic_partial_comparisons": diag_comparisons,
+        "note": "Synthetic or partial validation results are diagnostics, not paper outcomes.",
+    }
     (output / "statistics.json").write_text(json.dumps(package, indent=2), encoding="utf8")
     md = ["# SSOD experiment results", "",
-          f"Recorded completed metrics: {len(rows)}", "",
+          f"Recorded completed full-validation metrics: {len(rows)}", "",
           "**Do not report synthetic or partial-validation AP as paper results.**", "",
           "| Fraction | Variant | Seeds | Mean AP | Std AP |",
           "|---|---|---:|---:|---:|"]
@@ -115,6 +133,44 @@ def write_report(source, output):
                   f"{p['paired_mean_delta_AP']:.4f} | {interval} |")
     md.extend(["", "Interpret intervals conservatively: few seeds and many exploratory "
                "comparisons increase false-discovery risk.", ""])
+
+    if partial_rows:
+        md.extend([
+            "---",
+            "",
+            "## Diagnostic Partial-Validation Summary (NOT for paper reporting)",
+            "",
+            f"Recorded partial-validation diagnostic runs: {len(partial_rows)}",
+            "",
+            "| Experiment | Variant | Step | AP | AP50 | AP75 | AP_small | Elapsed (s) |",
+            "|---|---|---:|---:|---:|---:|---:|---:|",
+        ])
+        for r in sorted(partial_rows, key=lambda x: x.get("experiment", "")):
+            def _fmt(val):
+                try:
+                    return f"{float(val):.4f}"
+                except (TypeError, ValueError):
+                    return "N/A"
+            md.append(
+                f"| {r.get('experiment', '')} | {r.get('variant', '')} | {r.get('final_step', '')} | "
+                f"{_fmt(r.get('AP'))} | {_fmt(r.get('AP50'))} | {_fmt(r.get('AP75'))} | "
+                f"{_fmt(r.get('AP_small'))} | {r.get('elapsed_seconds', 'N/A')} |"
+            )
+        if diag_comparisons:
+            md.extend([
+                "",
+                "### Diagnostic Paired Deltas (Partial Validation)",
+                "",
+                "| Fraction | Comparison | Pairs | Delta AP |",
+                "|---|---|---:|---:|",
+            ])
+            for p in diag_comparisons:
+                md.append(
+                    f"| {p['fraction']} | {p['comparison']} | {p['n_pairs']} | "
+                    f"{p['paired_mean_delta_AP']:+.4f} |"
+                )
+        md.append("")
+
     (output / "PAPER_RESULTS.md").write_text("\n".join(md), encoding="utf8")
     return package
 

@@ -20,7 +20,12 @@ def render(root):
     # 1. Overall COCO AP bar charts by label fraction
     path = root / "statistics.json"
     if path.is_file():
-        summary = json.loads(path.read_text(encoding="utf8")).get("summary", [])
+        stat_obj = json.loads(path.read_text(encoding="utf8"))
+        summary = stat_obj.get("summary", [])
+        is_diag_only = False
+        if not summary and stat_obj.get("diagnostic_partial_summary"):
+            summary = stat_obj.get("diagnostic_partial_summary", [])
+            is_diag_only = True
         by_fraction = defaultdict(list)
         for row in summary:
             by_fraction[row["fraction"]].append(row)
@@ -33,10 +38,12 @@ def render(root):
             ax.bar(range(len(labels)), means, yerr=deviations, capsize=3)
             ax.set_xticks(range(len(labels)), labels, rotation=45, ha="right")
             ax.set_ylabel("COCO AP @[0.50:0.95] (%)")
-            ax.set_title(f"BDD100K {fraction}: observed results (mean +/- std)")
+            suffix = " (DIAGNOSTIC PARTIAL VAL — NOT FOR PAPER)" if is_diag_only else " (mean +/- std)"
+            ax.set_title(f"BDD100K {fraction}: observed results{suffix}")
             ax.set_ylim(bottom=0)
             fig.tight_layout()
-            fig.savefig(figure_dir / f"ap_{fraction}.png", dpi=180)
+            fname = f"ap_diagnostic_{fraction}.png" if is_diag_only else f"ap_{fraction}.png"
+            fig.savefig(figure_dir / fname, dpi=180)
             plt.close(fig)
 
     run_root = root / "runs"
@@ -61,7 +68,7 @@ def render(root):
             except (ValueError, KeyError, json.JSONDecodeError) as exc:
                 print(f"Skipping malformed training log {step_file}: {exc}")
 
-        # 3. Conformal Risk Control verification plots (Empirical FDR vs Target alpha & Threshold trajectories)
+        # 3. Conformal Risk Control verification plots (Risk vs Target alpha, Thresholds, Pooled Recall & FDR)
         for conf_file in run_root.rglob("conformal_calibration.jsonl"):
             try:
                 rows = [json.loads(s) for s in conf_file.read_text(encoding="utf8").splitlines() if s.strip()]
@@ -69,14 +76,27 @@ def render(root):
                     continue
                 key = str(conf_file.parent.relative_to(run_root)).replace("\\", "_").replace("/", "_")
                 steps = [r["step"] for r in rows]
-                alpha_s = float(rows[0].get("alpha_strict", 0.15))
+                alpha_s = float(rows[0].get("alpha_strict", 0.08))
+                risk_metric = str(rows[0].get("risk_metric", "fdr"))
+                has_recall = any(
+                    r.get("regimes", {}).get("clear", {}).get("pooled_empirical_recall") is not None
+                    for r in rows
+                )
 
-                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
+                ncols = 3 if has_recall else 2
+                fig, axes = plt.subplots(1, ncols, figsize=(5.5 * ncols, 4.5))
+                ax1, ax2 = axes[0], axes[1]
+                ax3 = axes[2] if has_recall else None
+                obs_risks = [alpha_s]
+
                 for regime, color in (("clear", "#1f77b4"), ("degraded", "#d62728")):
                     emp_r = [r.get("regimes", {}).get(regime, {}).get("empirical_weighted_risk") for r in rows]
                     ub_r = [r.get("regimes", {}).get(regime, {}).get("conformal_upper_bound") for r in rows]
                     tau_h = [r.get("regimes", {}).get(regime, {}).get("tau_high") for r in rows]
                     tau_l = [r.get("regimes", {}).get(regime, {}).get("tau_low") for r in rows]
+                    for v in emp_r + ub_r:
+                        if v is not None:
+                            obs_risks.append(float(v))
                     if any(v is not None for v in emp_r):
                         ax1.plot(steps, [v if v is not None else float("nan") for v in emp_r],
                                  marker="o", markersize=3, color=color, label=f"{regime} empirical risk")
@@ -89,11 +109,23 @@ def render(root):
                     if any(v is not None for v in tau_l):
                         ax2.plot(steps, [v if v is not None else float("nan") for v in tau_l],
                                  linestyle=":", color=color, label=f"{regime} tau_low (Zone 2)")
+                    if ax3 is not None:
+                        rec = [r.get("regimes", {}).get(regime, {}).get("pooled_empirical_recall") for r in rows]
+                        fdr = [r.get("regimes", {}).get(regime, {}).get("pooled_empirical_fdr") for r in rows]
+                        if any(v is not None for v in rec):
+                            ax3.plot(steps, [v if v is not None else float("nan") for v in rec],
+                                     marker="o", markersize=3, color=color, label=f"{regime} recall")
+                        if any(v is not None for v in fdr):
+                            ax3.plot(steps, [v if v is not None else float("nan") for v in fdr],
+                                     linestyle="--", color=color, alpha=0.65, label=f"{regime} pooled FDR")
+
                 ax1.axhline(alpha_s, color="black", linestyle="-.", linewidth=1.2, label=f"Target alpha={alpha_s}")
                 ax1.set_xlabel("Optimizer step")
-                ax1.set_ylabel("Weighted Pseudo-Label FDR Risk")
+                ylabel = "Weighted FP-per-GT Risk" if risk_metric == "monotone_fp_per_gt" else "Weighted Pseudo-Label FDR Risk"
+                ax1.set_ylabel(ylabel)
                 ax1.set_title("Conformal Risk Control Verification")
-                ax1.set_ylim(0, 1.0)
+                ymax = max(0.25, min(1.0, max(alpha_s * 2.5, max(obs_risks) * 1.25)))
+                ax1.set_ylim(0, ymax)
                 ax1.legend(fontsize=8)
 
                 ax2.set_xlabel("Optimizer step")
@@ -101,6 +133,13 @@ def render(root):
                 ax2.set_title("Adaptive Conformal Tri-Zone Thresholds")
                 ax2.set_ylim(0, 1.0)
                 ax2.legend(fontsize=8)
+
+                if ax3 is not None:
+                    ax3.set_xlabel("Optimizer step")
+                    ax3.set_ylabel("Rate")
+                    ax3.set_title("Calibration Recall & Pooled FDR")
+                    ax3.set_ylim(0, 1.0)
+                    ax3.legend(fontsize=8)
 
                 fig.suptitle(f"CoRe-SSOD Calibration: {conf_file.parent.relative_to(run_root)}")
                 fig.tight_layout()
