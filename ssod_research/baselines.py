@@ -28,8 +28,33 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from torchvision.models.detection.rpn import concat_box_prediction_layers
 
 from ssod_research.care_ssod import _flip_boxes_x
+
+
+@torch.no_grad()
+def extract_rpn_proposals_only(rpn, images, features: dict[str, torch.Tensor]) -> list[torch.Tensor]:
+    """Extract RPN proposals without targets while preserving training pre/post-NMS limits (2000).
+
+    Calling ``rpn(images, features, None)`` with ``rpn.training=True`` raises
+    ``ValueError('targets should not be None')`` in TorchVision, whereas toggling
+    ``rpn.training=False`` halves ``pre_nms_top_n`` and ``post_nms_top_n`` (2000 -> 1000).
+    """
+    for hook in rpn._forward_pre_hooks.values():
+        res = hook(rpn, (images, features, None))
+        if res is not None:
+            images, features, _ = res
+    feat_list = list(features.values())
+    objectness, pred_bbox_deltas = rpn.head(feat_list)
+    anchors = rpn.anchor_generator(images, feat_list)
+    num_images = len(anchors)
+    num_anchors_per_level = [o[0].shape[0] * o[0].shape[1] * o[0].shape[2] for o in objectness]
+    objectness, pred_bbox_deltas = concat_box_prediction_layers(objectness, pred_bbox_deltas)
+    proposals = rpn.box_coder.decode(pred_bbox_deltas.detach(), anchors)
+    proposals = proposals.view(num_images, -1, 4)
+    boxes, _ = rpn.filter_proposals(proposals, objectness, images.image_sizes, num_anchors_per_level)
+    return [b.detach() for b in boxes]
 
 
 # ------------------------------------------------------------------ 1. Soft Teacher (ICCV 2021)
@@ -182,8 +207,11 @@ def soft_teacher_unsupervised_loss(
     teacher_cache: dict[str, Any],
     *,
     cls_valid_list: list[torch.Tensor] | None = None,
+    scale_by_batch_size: bool = True,
+    filter_zero_box_images: bool = True,
 ) -> tuple[torch.Tensor | None, dict[str, float]]:
     """Faithful Soft Teacher (ICCV 2021) unsupervised loss with decoupled cls/reg & soft-negatives."""
+    total_batch_size = max(1, len(aug_images))
     if cls_valid_list is None:
         cls_targets = aug_targets
     else:
@@ -196,12 +224,15 @@ def soft_teacher_unsupervised_loss(
         for t, m in zip(aug_targets, reg_valid_list)
     ]
 
-    active = [
-        i for i in range(len(aug_images))
-        if len(cls_targets[i]["boxes"]) > 0 or len(reg_targets[i]["boxes"]) > 0
-    ]
+    if filter_zero_box_images:
+        active = [
+            i for i in range(len(aug_images))
+            if len(cls_targets[i]["boxes"]) > 0 or len(reg_targets[i]["boxes"]) > 0
+        ]
+    else:
+        active = list(range(len(aug_images)))
     if not active:
-        return None, {"unsup": 0.0, "stability": 0.0}
+        return None, {"unsup": 0.0, "stability": 0.0, "active_cls_images": 0, "active_reg_images": 0}
 
     if len(active) != len(aug_images):
         aug_images = [aug_images[i] for i in active]
@@ -213,9 +244,13 @@ def soft_teacher_unsupervised_loss(
             "transformed_sizes": [teacher_cache["transformed_sizes"][i] for i in active],
         }
 
-    cls_pos = [i for i, t in enumerate(cls_targets) if len(t["boxes"]) > 0]
+    cls_pos = (
+        [i for i, t in enumerate(cls_targets) if len(t["boxes"]) > 0]
+        if filter_zero_box_images
+        else list(range(len(cls_targets)))
+    )
     reg_pos = [i for i, t in enumerate(reg_targets) if len(t["boxes"]) > 0]
-    has_cls = len(cls_pos) > 0
+    has_cls = len(cls_pos) > 0 and (not filter_zero_box_images or any(len(t["boxes"]) > 0 for t in cls_targets))
     has_reg = len(reg_pos) > 0
 
     original_sizes = [(int(im.shape[-2]), int(im.shape[-1])) for im in aug_images]
@@ -298,7 +333,8 @@ def soft_teacher_unsupervised_loss(
             weights[bg_mask] = bg_r / bg_r.mean().clamp(min=1e-4)
         loss_cls = (per_sample_cls * weights).sum() / weights.sum().clamp(min=1.0)
         rpn_total = sum(rpn_losses.values())
-        total = rpn_total + loss_cls
+        cls_scale = (float(len(cls_pos)) / float(total_batch_size)) if scale_by_batch_size else 1.0
+        total = cls_scale * (rpn_total + loss_cls)
 
     # 2. Box regression ONLY on foreground proposals matched to jitter-verified reg_valid targets
     if has_reg:
@@ -311,7 +347,7 @@ def soft_teacher_unsupervised_loss(
                 [transformed.image_sizes[i] for i in missing_reg],
             )
             extra_feats = {k: v[missing_reg] for k, v in s_features.items()}
-            extra_props, _ = model.rpn(extra_imgs, extra_feats, None)
+            extra_props = extract_rpn_proposals_only(model.rpn, extra_imgs, extra_feats)
             for idx, prop in zip(missing_reg, extra_props):
                 proposals_by_idx[idx] = prop
 
@@ -344,17 +380,26 @@ def soft_teacher_unsupervised_loss(
             n_pos, num_classes = pos_logits.shape
             pos_box_reg = pos_box_reg.reshape(n_pos, num_classes, 4)
             labels_pos = reg_labels[pos_inds]
-            loss_box = F.smooth_l1_loss(
-                pos_box_reg[torch.arange(n_pos, device=labels_pos.device), labels_pos].float(),
-                reg_gt_deltas[pos_inds].float(),
-                beta=1.0 / 9.0,
-                reduction="sum",
-            ) / max(1, reg_labels.numel())
+            reg_scale = (float(len(reg_pos)) / float(total_batch_size)) if scale_by_batch_size else 1.0
+            loss_box = reg_scale * (
+                F.smooth_l1_loss(
+                    pos_box_reg[torch.arange(n_pos, device=labels_pos.device), labels_pos].float(),
+                    reg_gt_deltas[pos_inds].float(),
+                    beta=1.0 / 9.0,
+                    reduction="sum",
+                )
+                / max(1, reg_labels.numel())
+            )
             total = loss_box if total is None else (total + loss_box)
 
     if total is None:
-        return None, {"unsup": 0.0, "stability": 0.0}
-    return total, {"unsup": float(total.detach()), "stability": 0.0}
+        return None, {"unsup": 0.0, "stability": 0.0, "active_cls_images": len(cls_pos), "active_reg_images": len(reg_pos)}
+    return total, {
+        "unsup": float(total.detach()),
+        "stability": 0.0,
+        "active_cls_images": len(cls_pos),
+        "active_reg_images": len(reg_pos),
+    }
 
 
 # ------------------------------------------------------------------ 2. Dynamic GMM (Consistent-Teacher style)

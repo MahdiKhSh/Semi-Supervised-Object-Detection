@@ -26,6 +26,8 @@ CATEGORIES = (
     "motorcycle", "bicycle", "traffic light", "traffic sign",
 )
 CAT2ID = {name: i + 1 for i, name in enumerate(CATEGORIES)}
+# BDD100K Detection 2020 (Scalabel) uses "person" in some releases for "pedestrian"
+CATEGORY_ALIASES = {"person": "pedestrian", "motor": "motorcycle", "bike": "bicycle"}
 
 
 def convert(records, include_annotations=True):
@@ -41,8 +43,9 @@ def convert(records, include_annotations=True):
         images.append({"id": image_id, "file_name": filename, "width": width, "height": height})
         if not include_annotations:
             continue
-        for label in item.get("labels", []):
-            cls, box = label.get("category"), label.get("box2d")
+        for label in item.get("labels") or []:
+            raw_cls, box = label.get("category"), label.get("box2d")
+            cls = CATEGORY_ALIASES.get(raw_cls, raw_cls)
             if cls not in CAT2ID or not box:
                 continue
             x1, y1, x2, y2 = (float(box[k]) for k in ("x1", "y1", "x2", "y2"))

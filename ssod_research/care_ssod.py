@@ -452,9 +452,13 @@ def teacher_bidirectional_probe(
             b2[:, [0, 2]] = (b2[:, [0, 2]] * (float(ow) / max(1, tw2))).clamp(0.0, float(ow))
             b2[:, [1, 3]] = (b2[:, [1, 3]] * (float(oh) / max(1, th2))).clamp(0.0, float(oh))
             b2 = _flip_boxes_x(b2, ow)
-            # Ensure well-ordered non-degenerate fused boxes
-            b2[:, 2] = torch.maximum(b2[:, 2], b2[:, 0] + 1.0)
-            b2[:, 3] = torch.maximum(b2[:, 3], b2[:, 1] + 1.0)
+            # Ensure well-ordered non-degenerate boxes strictly inside [0, ow] x [0, oh]
+            max_x1 = max(0.0, float(ow) - 1.0)
+            max_y1 = max(0.0, float(oh) - 1.0)
+            b2[:, 0] = b2[:, 0].clamp(0.0, max_x1)
+            b2[:, 1] = b2[:, 1].clamp(0.0, max_y1)
+            b2[:, 2] = torch.maximum(b2[:, 2].clamp(0.0, float(ow)), (b2[:, 0] + 1.0).clamp(max=float(ow)))
+            b2[:, 3] = torch.maximum(b2[:, 3].clamp(0.0, float(oh)), (b2[:, 1] + 1.0).clamp(max=float(oh)))
 
             s2_rep = p2[rows, labels].clamp(0.0, 1.0)
             iou_vec = elementwise_iou(b1, b2)
@@ -470,10 +474,14 @@ def teacher_bidirectional_probe(
             w1 = s1.clamp(min=1e-4)[:, None]
             w2 = s2_rep.clamp(min=1e-4)[:, None]
             fused_boxes = (w1 * b1 + w2 * b2) / (w1 + w2)
-            fused_boxes[:, 0] = fused_boxes[:, 0].clamp(0.0, float(ow))
-            fused_boxes[:, 1] = fused_boxes[:, 1].clamp(0.0, float(oh))
-            fused_boxes[:, 2] = torch.maximum(fused_boxes[:, 2].clamp(0.0, float(ow)), fused_boxes[:, 0] + 1.0)
-            fused_boxes[:, 3] = torch.maximum(fused_boxes[:, 3].clamp(0.0, float(oh)), fused_boxes[:, 1] + 1.0)
+            fused_boxes[:, 0] = fused_boxes[:, 0].clamp(0.0, max_x1)
+            fused_boxes[:, 1] = fused_boxes[:, 1].clamp(0.0, max_y1)
+            fused_boxes[:, 2] = torch.maximum(
+                fused_boxes[:, 2].clamp(0.0, float(ow)), (fused_boxes[:, 0] + 1.0).clamp(max=float(ow))
+            )
+            fused_boxes[:, 3] = torch.maximum(
+                fused_boxes[:, 3].clamp(0.0, float(oh)), (fused_boxes[:, 1] + 1.0).clamp(max=float(oh))
+            )
 
             consensus_score = 0.5 * (s1 + s2_rep)
             reliability = (consensus_score * torch.exp(-float(loc_alpha) * u_loc - float(cls_alpha) * u_cls)).clamp(0.0, 1.0)
@@ -666,17 +674,41 @@ def strong_view_care(
         z1["boxes"] = _flip_boxes_x(z1["boxes"], w)
         z2["boxes"] = _flip_boxes_x(z2["boxes"], w)
 
-    # Box-safe mild Random Erasing / Cutout (1-2 small patches simulating occlusion/glare)
+    # Small-object-safe Random Erasing / Cutout: never occlude > 35% of any Zone-1/Zone-2 box
+    # (prevents wiping out tiny 8x12 traffic lights/signs into solid gray while keeping their GT label!)
     if enable_cutout and rng.random() < 0.40:
         _, h, w = img.shape
+        guard_parts = [b for b in (z1["boxes"], z2["boxes"]) if len(b) > 0]
+        guard_boxes = torch.cat(guard_parts, dim=0).float() if guard_parts else None
+        guard_areas = (
+            ((guard_boxes[:, 2] - guard_boxes[:, 0]).clamp(min=1.0)
+             * (guard_boxes[:, 3] - guard_boxes[:, 1]).clamp(min=1.0))
+            if guard_boxes is not None
+            else None
+        )
         n_patches = rng.randint(1, 2)
         for _ in range(n_patches):
             ph = max(4, int(h * rng.uniform(0.03, 0.10)))
             pw = max(4, int(w * rng.uniform(0.03, 0.10)))
-            y0 = rng.randint(0, max(0, h - ph))
-            x0 = rng.randint(0, max(0, w - pw))
             fill_val = rng.uniform(0.0, 1.0)
-            img[:, y0:y0 + ph, x0:x0 + pw] = fill_val
+            chosen_patch = None
+            for _attempt in range(4):
+                y0 = rng.randint(0, max(0, h - ph))
+                x0 = rng.randint(0, max(0, w - pw))
+                if guard_boxes is None or guard_areas is None:
+                    chosen_patch = (x0, y0)
+                    break
+                ix1 = torch.clamp(guard_boxes[:, 0], min=float(x0))
+                iy1 = torch.clamp(guard_boxes[:, 1], min=float(y0))
+                ix2 = torch.clamp(guard_boxes[:, 2], max=float(x0 + pw))
+                iy2 = torch.clamp(guard_boxes[:, 3], max=float(y0 + ph))
+                inter = (ix2 - ix1).clamp(min=0.0) * (iy2 - iy1).clamp(min=0.0)
+                if float((inter / guard_areas).max().item()) <= 0.35:
+                    chosen_patch = (x0, y0)
+                    break
+            if chosen_patch is not None:
+                px0, py0 = chosen_patch
+                img[:, py0:py0 + ph, px0:px0 + pw] = fill_val
 
     if return_flip:
         return img, z1, z2, flipped
@@ -835,6 +867,8 @@ def care_unsupervised_loss(
     kl_zone2_weight: float = 0.05,
     temperature: float = 1.5,
     reg_loc_thresh: float = 0.55,
+    scale_by_batch_size: bool = True,
+    filter_zero_box_images: bool = True,
 ) -> tuple[torch.Tensor | None, dict[str, float]]:
     """Single-pass feature-shared CoRe-SSOD / CaRe-SSOD unsupervised loss.
 
@@ -857,6 +891,8 @@ def care_unsupervised_loss(
     if not has_z1 and not has_z2:
         return None, {"unsup": 0.0, "stability": 0.0, "suppressed_bg": 0}
 
+    total_batch_size = max(1, len(aug_images))
+
     original_sizes = [(int(im.shape[-2]), int(im.shape[-1])) for im in aug_images]
     transformed, transformed_targets = model.transform(aug_images, zone1_targets if has_z1 else None)
     features = model.backbone(transformed.tensors)
@@ -876,7 +912,11 @@ def care_unsupervised_loss(
     #    (An unlabeled image with 0 Zone-1 pseudo-boxes is unknown foreground — e.g. dark night —
     #     NOT a verified empty negative image! Full feature maps are retained below for Zone-2 KL.)
     if has_z1 and transformed_targets is not None:
-        positive = [i for i, target in enumerate(transformed_targets) if len(target["boxes"]) > 0]
+        positive = (
+            [i for i, target in enumerate(transformed_targets) if len(target["boxes"]) > 0]
+            if filter_zero_box_images
+            else list(range(len(transformed_targets)))
+        )
         if len(positive) == len(aug_images):
             det_images = transformed
             det_features = features
@@ -1047,27 +1087,32 @@ def care_unsupervised_loss(
             loss_box = box_regression.sum() * 0.0
             loss_giou = box_regression.sum() * 0.0
 
-        det_total = sum(rpn_losses.values()) + loss_cls + loss_box
-        total = det_total + loss_giou
+        det_scale = (float(len(positive)) / float(total_batch_size)) if scale_by_batch_size else 1.0
+        det_total = det_scale * (sum(rpn_losses.values()) + loss_cls + loss_box)
+        scaled_giou = det_scale * loss_giou
+        total = det_total + scaled_giou
         det_loss_val = float(det_total.detach())
-        stab_loss_val += float(loss_giou.detach())
+        stab_loss_val += float(scaled_giou.detach())
 
     # 2. Mild calibrated full-distribution KL distillation on Zone 1 (reusing student FPN)
     z1_boxes_trans = _scale_boxes_to_transformed(
         [z["boxes"] for z in zone1_meta], original_sizes, transformed.image_sizes
     )
-    if kl_zone1_weight > 0.0 and sum(len(b) for b in z1_boxes_trans) > 0:
+    n_z1_imgs = sum(1 for b in z1_boxes_trans if len(b) > 0)
+    if kl_zone1_weight > 0.0 and n_z1_imgs > 0:
         roi_f1 = model.roi_heads.box_roi_pool(features, z1_boxes_trans, transformed.image_sizes)
         roi_f1 = model.roi_heads.box_head(roi_f1)
         logits1, _ = model.roi_heads.box_predictor(roi_f1)
         probs1 = torch.cat([z["probs"] for z in zone1_meta], dim=0)
         rel1 = torch.cat([z["reliability"] for z in zone1_meta], dim=0)
-        loss_kl1 = float(kl_zone1_weight) * _kl_soft_distillation(logits1, probs1, rel1, temperature=temperature)
+        kl1_scale = (float(n_z1_imgs) / float(total_batch_size)) if scale_by_batch_size else 1.0
+        loss_kl1 = kl1_scale * float(kl_zone1_weight) * _kl_soft_distillation(logits1, probs1, rel1, temperature=temperature)
         total = loss_kl1 if total is None else (total + loss_kl1)
         stab_loss_val += float(loss_kl1.detach())
 
     # 3. Mild calibrated full-distribution KL distillation on Zone 2 (includes background mass)
-    if use_tri_zone and kl_zone2_weight > 0.0 and sum(len(b) for b in ambig_trans) > 0:
+    n_z2_imgs = sum(1 for b in ambig_trans if len(b) > 0)
+    if use_tri_zone and kl_zone2_weight > 0.0 and n_z2_imgs > 0:
         roi_f2 = model.roi_heads.box_roi_pool(features, ambig_trans, transformed.image_sizes)
         roi_f2 = model.roi_heads.box_head(roi_f2)
         logits2, _ = model.roi_heads.box_predictor(roi_f2)
@@ -1075,7 +1120,8 @@ def care_unsupervised_loss(
         p_tp2 = torch.cat(
             [z.get("p_tp", z["reliability"]) for z in zone2_meta], dim=0
         )
-        loss_kl2 = float(kl_zone2_weight) * _kl_soft_distillation(logits2, probs2, p_tp2, temperature=temperature)
+        kl2_scale = (float(n_z2_imgs) / float(total_batch_size)) if scale_by_batch_size else 1.0
+        loss_kl2 = kl2_scale * float(kl_zone2_weight) * _kl_soft_distillation(logits2, probs2, p_tp2, temperature=temperature)
         total = loss_kl2 if total is None else (total + loss_kl2)
         stab_loss_val += float(loss_kl2.detach())
 

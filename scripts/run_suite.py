@@ -93,6 +93,15 @@ def parse_args(argv=None):
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--grad-accum-steps", type=int, default=None)
     p.add_argument("--detector", choices=("fasterrcnn_v1", "fasterrcnn_v2"), default=None)
+    p.add_argument("--anchor-profile", choices=("default", "road_small"), default="default")
+    p.add_argument("--reserve-calibration", action=argparse.BooleanOptionalAction, default=None,
+                   help="Override calibration-fold reservation policy (default: True when core_ssod is in suite).")
+    p.add_argument("--stratify-calibration", action="store_true",
+                   help="Stratify calibration fold by weather/time-of-day and rare-class presence.")
+    p.add_argument("--zero-box-filter", type=int, choices=(0, 1), default=None,
+                   help="Override zero-pseudo-box image filtering (1=exclude from hard RPN/ROI, 0=legacy).")
+    p.add_argument("--eval-max-images", type=int, default=None,
+                   help="Optional validation subset size override (0 = full validation set).")
     p.add_argument("--lr", type=float, default=None)
     p.add_argument(
         "--lr-schedule",
@@ -354,7 +363,10 @@ def generate_jobs(args):
         if is_q1
         else lr_wu_train
     )
-    reserve_calibration = any(variant == "core_ssod" for variant, *_ in variants)
+    if getattr(args, "reserve_calibration", None) is None:
+        reserve_calibration = any(variant == "core_ssod" for variant, *_ in variants)
+    else:
+        reserve_calibration = bool(args.reserve_calibration)
     jobs = []
     for fraction, seed in specs:
         frac_tag = f"{round(100 * fraction):02d}pct"
@@ -374,10 +386,20 @@ def generate_jobs(args):
             "--save-every", str(save_every),
             "--amp", amp_arg,
         ]
+        if getattr(args, "anchor_profile", "default") != "default":
+            common += ["--anchor-profile", str(args.anchor_profile)]
         if reserve_calibration:
             common.append("--reserve-calibration")
+        if getattr(args, "stratify_calibration", False):
+            common.append("--stratify-calibration")
+        if getattr(args, "zero_box_filter", None) is not None:
+            common += ["--zero-box-filter", str(int(args.zero_box_filter))]
+        eval_max_override = getattr(args, "eval_max_images", None)
         if args.preset == "smoke":
-            common += ["--no-pretrained-backbone", "--eval-max-images", "4"]
+            common += ["--no-pretrained-backbone", "--eval-max-images", str(eval_max_override if eval_max_override is not None else 4)]
+        elif eval_max_override is not None:
+            if int(eval_max_override) > 0:
+                common += ["--eval-max-images", str(int(eval_max_override))]
         elif args.preset == "pilot":
             common += ["--eval-max-images", "50"]
         elif args.preset == "q1_pilot":
@@ -817,11 +839,21 @@ def job_complete(job):
     saved = status.get("arguments", {})
     if bool(saved.get("reserve_calibration")) != ("--reserve-calibration" in job["command"]):
         raise RuntimeError(f"Calibration split policy changed for {out}. Use a new output path.")
+    if bool(saved.get("stratify_calibration")) != ("--stratify-calibration" in job["command"]):
+        raise RuntimeError(f"Calibration stratification policy changed for {out}. Use a new output path.")
+    planned_eval_max = int(_flag(job["command"], "eval_max_images") or 0)
+    saved_eval_max = int(saved.get("eval_max_images") or 0)
+    if planned_eval_max != saved_eval_max:
+        raise RuntimeError(
+            f"Validation subset policy changed for {out}: eval_max_images "
+            f"{saved_eval_max} versus {planned_eval_max}. Use a new output path."
+        )
     # Check only scientific hyperparameters (NOT machine-local paths or micro-batch split
     # so Kaggle 2x4 -> RTX 5090 4x2 transfers resume cleanly!).
     for flag in (
-        "variant", "detector", "seed", "max_side", "pseudo_threshold",
+        "variant", "detector", "anchor_profile", "seed", "max_side", "pseudo_threshold",
         "lr", "lr_schedule", "lr_warmup_steps", "ema", "unsup_warmup_steps",
+        "zero_box_filter",
         "box_weight", "class_weight", "confidence_weight",
         "localization_scale", "localization_enabled", "adaptive_strength",
         "condition_offset", "consistency_weight",
@@ -842,6 +874,28 @@ def job_complete(job):
         if saved_eff != planned_eff:
             raise RuntimeError(
                 f"Effective batch size changed for {out}: {saved_eff} vs {planned_eff}. Use a new output path."
+            )
+    # Cryptographically verify split annotation hashes & upstream warmup checkpoint hash!
+    saved_ds_hashes = status.get("dataset_sha256") or {}
+    split_ann_dir = Path(job["split_dir"]) / "annotations"
+    for ann_name in ("labeled.json", "val.json", "unlabeled.json"):
+        if ann_name in saved_ds_hashes:
+            ann_path = split_ann_dir / ann_name
+            if not ann_path.is_file():
+                return False
+            if sha256_file(ann_path) != saved_ds_hashes[ann_name]:
+                raise RuntimeError(
+                    f"Split annotation {ann_name} changed on disk after {out} was trained. Use a new output path."
+                )
+    planned_init = _flag(job["command"], "init_checkpoint")
+    if planned_init is not None:
+        init_path = Path(planned_init)
+        saved_init_sha = (status.get("scientific_identity") or {}).get("init_checkpoint_sha256")
+        if not init_path.is_file():
+            return False
+        if saved_init_sha and sha256_file(init_path) != saved_init_sha:
+            raise RuntimeError(
+                f"Upstream warm-start checkpoint {init_path} changed after {out} was trained. Use a new output path."
             )
     if status.get("status") != "completed":
         return False
@@ -1086,6 +1140,7 @@ def _sync_disk_state_to_registry(args, dag: PipelineDAG, registry: ExperimentReg
                 continue
             if done:
                 if rec["status"] != "COMPLETED":
+                    eff_map = dag.effective_fingerprints()
                     registry.mark_completed(
                         node.experiment_id,
                         last_completed_step=int(job["steps"]),
@@ -1095,6 +1150,7 @@ def _sync_disk_state_to_registry(args, dag: PipelineDAG, registry: ExperimentReg
                         config_fingerprint=node.config_fingerprint,
                         dataset_fingerprint=node.dataset_fingerprint,
                         split_fingerprint=node.split_fingerprint,
+                        upstream_fingerprint=dag.upstream_fingerprint(node.experiment_id, eff_map),
                         resume_mode=manifest.get("resume_mode") or "exact",
                     )
             else:
@@ -1494,14 +1550,37 @@ def main(argv=None):
             eval_id = make_experiment_id(args.preset, f"{job['name']}/eval")
             an_id = make_experiment_id(args.preset, f"{job['name']}/analysis")
 
-            # Check whether primary job is already verified COMPLETED
+            # Check whether primary job is already cryptographically verified COMPLETED
             already_complete = False
             if args.resume:
                 rec = registry.get_stage(stage_id)
-                if rec and rec["status"] == "COMPLETED" and job_complete(job):
+                if job_complete(job):
                     already_complete = True
-                elif job_complete(job):
-                    already_complete = True
+                    if rec and rec["status"] != "COMPLETED":
+                        eff_now = dag.effective_fingerprints()
+                        if job["type"] == "prepare":
+                            sm = read_json(Path(job["output"]), {}) or {}
+                            registry.mark_completed(
+                                stage_id,
+                                artifacts={"split_manifest": job["output"]},
+                                split_fingerprint=sm.get("split_fingerprint"),
+                            )
+                            dag = build_pipeline_dag(args, jobs)
+                        else:
+                            out_dir = Path(job["output"])
+                            mf = read_json(out_dir / "manifest.json", {}) or {}
+                            registry.mark_completed(
+                                stage_id,
+                                last_completed_step=int(job["steps"]),
+                                checkpoint_path=mf.get("last_checkpoint") or str(out_dir / "last.pth"),
+                                checkpoint_sha256=mf.get("last_checkpoint_sha256"),
+                                accumulated_runtime_sec=float(mf.get("elapsed_seconds") or 0.0),
+                                config_fingerprint=dag.nodes[stage_id].config_fingerprint,
+                                dataset_fingerprint=dag.nodes[stage_id].dataset_fingerprint,
+                                split_fingerprint=dag.nodes[stage_id].split_fingerprint,
+                                upstream_fingerprint=dag.upstream_fingerprint(stage_id, eff_now),
+                                resume_mode=mf.get("resume_mode") or "exact",
+                            )
 
             if already_complete:
                 print(f"[{i + 1}/{len(jobs)}] SKIP already complete: {job['name']}", flush=True)
@@ -1589,9 +1668,36 @@ def main(argv=None):
                     split_fingerprint=manifest.get("split_fingerprint"),
                     runtime_delta_sec=time.monotonic() - t_job,
                 )
+                # Refresh DAG so downstream stages record the exact post-prepare split_fingerprint
+                # (eliminates false split_fingerprint / upstream_fingerprint invalidations on restart!).
+                dag = build_pipeline_dag(args, jobs)
+                eff_post_prep = dag.effective_fingerprints()
+                for ds_node in dag.topological_order():
+                    ds_rec = registry.get_stage(ds_node.experiment_id)
+                    if ds_rec and ds_rec["status"] == "PENDING":
+                        registry.upsert_stage(
+                            experiment_id=ds_node.experiment_id,
+                            suite_preset=ds_node.suite_preset,
+                            stage_name=ds_node.stage_name,
+                            stage_type=ds_node.stage_type,
+                            stage_order=ds_node.order,
+                            dependencies=ds_node.dependencies,
+                            config=ds_node.config,
+                            config_fingerprint=ds_node.config_fingerprint,
+                            dataset_fingerprint=ds_node.dataset_fingerprint,
+                            split_fingerprint=ds_node.split_fingerprint,
+                            upstream_fingerprint=dag.upstream_fingerprint(ds_node.experiment_id, eff_post_prep),
+                            model_variant=ds_node.model_variant,
+                            seed=ds_node.seed,
+                            label_fraction=ds_node.label_fraction,
+                            threshold=ds_node.threshold,
+                            target_steps=ds_node.target_steps,
+                            output_dir=ds_node.output_dir,
+                        )
             else:
                 out_dir = Path(job["output"])
                 manifest = read_json(out_dir / "manifest.json", {}) or {}
+                eff_done = dag.effective_fingerprints()
                 registry.mark_completed(
                     stage_id,
                     last_completed_step=int(job["steps"]),
@@ -1601,6 +1707,7 @@ def main(argv=None):
                     config_fingerprint=dag.nodes[stage_id].config_fingerprint,
                     dataset_fingerprint=dag.nodes[stage_id].dataset_fingerprint,
                     split_fingerprint=dag.nodes[stage_id].split_fingerprint,
+                    upstream_fingerprint=dag.upstream_fingerprint(stage_id, eff_done),
                     resume_mode=manifest.get("resume_mode") or "fresh",
                 )
                 if eval_id in dag.nodes:

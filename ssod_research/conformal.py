@@ -52,22 +52,78 @@ def split_calibration_indices(
     seed: int = 42,
     cal_fraction: float = 0.08,
     max_cal: int = 256,
+    strata: list[str] | None = None,
 ) -> tuple[list[int], list[int]]:
     """Deterministically partition labeled training indices into (train_ids, cal_ids).
 
     Strictly disjoint: calibration images are NEVER used for supervised student
     gradient updates, preserving exchangeability for the Conformal Risk Control
     guarantee while NEVER touching the validation set.
+
+    When ``strata`` (length ``dataset_size``) is provided, performs proportional
+    largest-remainder stratified sampling while guaranteeing every stratum retains
+    at least one supervised training sample (preventing rare classes/fog from being
+    drained out of training or omitted from calibration).
     """
     n = int(dataset_size)
     if n < 2:
         return list(range(n)), []
-    indices = list(range(n))
-    rng = random.Random(int(seed) * 9973 + 17)
-    rng.shuffle(indices)
     n_cal = max(1, min(int(max_cal), n - 1, int(round(n * float(cal_fraction)))))
-    cal_ids = sorted(indices[:n_cal])
-    train_ids = sorted(indices[n_cal:])
+    rng = random.Random(int(seed) * 9973 + 17)
+
+    if not strata or len(strata) != n:
+        indices = list(range(n))
+        rng.shuffle(indices)
+        cal_ids = sorted(indices[:n_cal])
+        train_ids = sorted(indices[n_cal:])
+        assert set(cal_ids).isdisjoint(set(train_ids))
+        return train_ids, cal_ids
+
+    by_stratum: dict[str, list[int]] = {}
+    for idx, key in enumerate(strata):
+        by_stratum.setdefault(str(key), []).append(idx)
+    for key in sorted(by_stratum):
+        rng.shuffle(by_stratum[key])
+
+    # Every stratum keeps >= 1 training sample -> max calibration quota is len(group) - 1
+    caps = {k: max(0, len(idxs) - 1) for k, idxs in by_stratum.items()}
+    total_cap = sum(caps.values())
+    if total_cap <= 0:
+        indices = list(range(n))
+        rng.shuffle(indices)
+        return sorted(indices[1:]), sorted(indices[:1])
+
+    target_cal = min(n_cal, total_cap)
+    quotas: dict[str, int] = {}
+    remainders: list[tuple[float, str]] = []
+    for k in sorted(by_stratum):
+        exact = target_cal * (len(by_stratum[k]) / float(n))
+        base = min(caps[k], int(math.floor(exact)))
+        quotas[k] = base
+        if quotas[k] < caps[k]:
+            remainders.append((exact - base, k))
+
+    shortfall = target_cal - sum(quotas.values())
+    remainders.sort(key=lambda pair: (-pair[0], pair[1]))
+    r_idx = 0
+    while shortfall > 0 and remainders:
+        _, k = remainders[r_idx % len(remainders)]
+        if quotas[k] < caps[k]:
+            quotas[k] += 1
+            shortfall -= 1
+        r_idx += 1
+        if r_idx > len(remainders) * (target_cal + 2):
+            break
+
+    cal_ids_list: list[int] = []
+    train_ids_list: list[int] = []
+    for k in sorted(by_stratum):
+        q = quotas[k]
+        grp = by_stratum[k]
+        cal_ids_list.extend(grp[:q])
+        train_ids_list.extend(grp[q:])
+    cal_ids = sorted(cal_ids_list)
+    train_ids = sorted(train_ids_list)
     assert set(cal_ids).isdisjoint(set(train_ids))
     return train_ids, cal_ids
 
@@ -112,16 +168,16 @@ def _match_detections_to_gt(
 def _monotone_fp_per_gt_curve(
     reliabilities: list[float],
     tp_flags: list[int],
-    num_gt: int,
+    num_gt: float | int,
     grid: list[float],
 ) -> tuple[list[float], list[int]]:
     """Compute exact, naturally monotone False-Discovery-per-Object curve in [0, 1].
 
-    L_FPR(x; lam) = min(1, FP(lam) / max(1, |G|)) is provably non-increasing in lam
+    L_FPR(x; lam) = min(1, FP(lam) / max(1.0, denom)) is provably non-increasing in lam
     with ZERO suffix-max inflation, satisfying Angelopoulos et al. (ICLR 2024)
     Theorem 1 directly.
     """
-    denom = float(max(1, int(num_gt)))
+    denom = max(1.0, float(num_gt))
     fp_rels = sorted((float(q) for q, is_tp in zip(reliabilities, tp_flags) if not is_tp), reverse=True)
     all_rels = sorted((float(q) for q in reliabilities), reverse=True)
 
@@ -227,8 +283,19 @@ def solve_conformal_threshold(
     *,
     min_threshold: float = 0.25,
     max_threshold: float = 0.90,
+    max_weight: float | None = None,
 ) -> dict[str, Any]:
-    """Solve weighted Conformal Risk Control for the smallest valid threshold."""
+    """Solve weighted Conformal Risk Control for the smallest valid threshold.
+
+    Under covariate shift with bounded likelihood-ratio weights w_i <= w_worst and
+    bounded loss B = 1 (Angelopoulos et al., ICLR 2024 Sec. 4.1; Tibshirani et al.,
+    NeurIPS 2019), the finite-sample worst-case weighted risk upper bound is:
+
+        U_WCRC(lam) = (sum_i w_i * L_i(lam) + w_worst) / (sum_i w_i + w_worst)
+
+    which reduces identically to ((n / (n + 1)) * R_hat + 1 / (n + 1)) when all
+    weights are uniform.
+    """
     if not loss_curves or not weights:
         return {
             "threshold": max(min_threshold, min(max_threshold, 0.70)),
@@ -248,6 +315,8 @@ def solve_conformal_threshold(
             "bound_satisfied": False,
         }
     n_eff = (w_sum * w_sum) / w_sq_sum
+    w_worst = float(max_weight) if max_weight is not None else float(max(weights))
+    w_worst = max(w_worst, 1e-6)
 
     chosen_idx = None
     best_emp = 1.0
@@ -255,8 +324,9 @@ def solve_conformal_threshold(
     for g_idx, lam in enumerate(grid):
         if lam < min_threshold or lam > max_threshold:
             continue
-        r_hat = sum(w * curve[g_idx] for w, curve in zip(weights, loss_curves)) / w_sum
-        upper = (n_eff / (n_eff + 1.0)) * r_hat + (1.0 / (n_eff + 1.0))
+        weighted_loss_sum = sum(w * curve[g_idx] for w, curve in zip(weights, loss_curves))
+        r_hat = weighted_loss_sum / w_sum
+        upper = (weighted_loss_sum + w_worst) / (w_sum + w_worst)
         if upper <= float(alpha):
             chosen_idx = g_idx
             best_emp = r_hat
@@ -274,8 +344,9 @@ def solve_conformal_threshold(
 
     valid_indices = [i for i, lam in enumerate(grid) if min_threshold <= lam <= max_threshold]
     last_idx = valid_indices[-1] if valid_indices else len(grid) - 1
-    r_hat = sum(w * curve[last_idx] for w, curve in zip(weights, loss_curves)) / w_sum
-    upper = (n_eff / (n_eff + 1.0)) * r_hat + (1.0 / (n_eff + 1.0))
+    weighted_loss_sum = sum(w * curve[last_idx] for w, curve in zip(weights, loss_curves))
+    r_hat = weighted_loss_sum / w_sum
+    upper = (weighted_loss_sum + w_worst) / (w_sum + w_worst)
     return {
         "threshold": float(max_threshold),
         "empirical_risk": round(float(r_hat), 5),
@@ -303,8 +374,10 @@ class WeightedConformalRiskCalibrator:
         alpha_strict: float = 0.10,
         alpha_loose: float = 0.30,
         min_high: float = 0.45,
-        max_high: float = 0.95,
+        max_high: float = 0.92,
         min_low: float = 0.25,
+        max_low: float = 0.55,
+        max_importance_weight: float = 2.5,
         shrinkage_prior: float = 20.0,
         use_visibility_weighting: bool = True,
         num_vis_bins: int = 6,
@@ -317,6 +390,8 @@ class WeightedConformalRiskCalibrator:
         self.min_high = float(min_high)
         self.max_high = float(max_high)
         self.min_low = float(min_low)
+        self.max_low = float(max_low)
+        self.max_importance_weight = float(max_importance_weight)
         self.shrinkage_prior = float(shrinkage_prior)
         self.use_visibility_weighting = bool(use_visibility_weighting)
         self.num_vis_bins = int(num_vis_bins)
@@ -365,7 +440,7 @@ class WeightedConformalRiskCalibrator:
         tau_hi = float(self.class_high[reg].get(int(cls_id), self.regime_high[reg]))
         tau_lo = float(self.class_low[reg].get(int(cls_id), self.regime_low[reg]))
         tau_hi = max(self.min_high, min(self.max_high, tau_hi))
-        tau_lo = max(self.min_low, min(tau_hi - 0.05, tau_lo))
+        tau_lo = max(self.min_low, min(tau_hi - 0.08, self.max_low, tau_lo))
         return tau_hi, tau_lo
 
     def precision_for(self, reliability: float, regime: str = "clear") -> float:
@@ -428,7 +503,7 @@ class WeightedConformalRiskCalibrator:
                 weights.append(1.0)
             else:
                 ratio = p_target[b] / p_cal[b]
-                weights.append(max(0.25, min(4.0, ratio)))
+                weights.append(max(1.0 / self.max_importance_weight, min(self.max_importance_weight, ratio)))
         return weights
 
     @torch.no_grad()
@@ -458,6 +533,7 @@ class WeightedConformalRiskCalibrator:
         per_class_entries: dict[int, list[tuple[list[float], float, str]]] = {
             c: [] for c in range(1, self.num_classes + 1)
         }
+        raw_cal_records: list[tuple[float, str, int, list[float], list[int], list[int], list[int]]] = []
         gt_by_regime = {"clear": 0, "degraded": 0}
         imgs_by_regime = {"clear": 0, "degraded": 0}
         det_records_by_regime: dict[str, list[tuple[float, int]]] = {"clear": [], "degraded": []}
@@ -524,21 +600,50 @@ class WeightedConformalRiskCalibrator:
                             all_det_records.append(rec)
                             det_records_by_regime.setdefault(regime_i, []).append(rec)
 
-                    curve, _ = _monotone_fp_per_gt_curve(rel_list, tp_flags, n_gt, self.grid)
-                    image_curves.append(curve)
-
-                    # Per-class monotone FP-per-GT curves ONLY for classes with predicted candidates in this image
-                    # (prevents zero-prediction images from diluting rare-class FP risk!)
-                    pred_classes = {int(c) for c in lbl_list if int(c) in per_class_entries}
-                    for cls_id in pred_classes:
-                        c_rels = [q for q, c in zip(rel_list, lbl_list) if int(c) == cls_id]
-                        c_tps = [t for t, c in zip(tp_flags, lbl_list) if int(c) == cls_id]
-                        c_gt_count = sum(1 for g in gt_lbl_list if int(g) == cls_id)
-                        c_curve, _ = _monotone_fp_per_gt_curve(c_rels, c_tps, max(1, c_gt_count), self.grid)
-                        per_class_entries[cls_id].append((c_curve, deg, regime_i))
+                    raw_cal_records.append((deg, regime_i, n_gt, rel_list, tp_flags, lbl_list, gt_lbl_list))
         finally:
             if io_pool is not None:
                 io_pool.shutdown(wait=True)
+
+        # Regime-smoothed GT density normalizer prevents sparse night highway scenes
+        # (n_gt=1..2) from suffering an artificial 9x-18x per-FP penalty vs crowded daytime streets.
+        global_mean_gt = max(1.0, float(total_gt) / max(1, len(chosen)))
+        mean_gt_by_regime = {
+            r: (max(1.0, float(gt_by_regime[r]) / float(imgs_by_regime[r])) if imgs_by_regime.get(r, 0) > 0 else global_mean_gt)
+            for r in ("clear", "degraded")
+        }
+        cls_gt_totals = {c: 0 for c in range(1, self.num_classes + 1)}
+        cls_pos_imgs = {c: 0 for c in range(1, self.num_classes + 1)}
+        for _, _, _, _, _, _, gt_lbl_list in raw_cal_records:
+            for c in set(int(g) for g in gt_lbl_list if int(g) in cls_gt_totals):
+                cls_pos_imgs[c] += 1
+            for g in gt_lbl_list:
+                gi = int(g)
+                if gi in cls_gt_totals:
+                    cls_gt_totals[gi] += 1
+        mean_cls_gt = {
+            c: max(2.0, float(cls_gt_totals[c]) / max(1, cls_pos_imgs[c]))
+            for c in range(1, self.num_classes + 1)
+        }
+
+        for deg, regime_i, n_gt, rel_list, tp_flags, lbl_list, gt_lbl_list in raw_cal_records:
+            eff_denom = max(1.0, 0.5 * float(n_gt) + 0.5 * mean_gt_by_regime.get(regime_i, global_mean_gt))
+            curve, _ = _monotone_fp_per_gt_curve(rel_list, tp_flags, eff_denom, self.grid)
+            image_curves.append(curve)
+
+            # Per-class monotone curves ONLY on images with GT of class c OR non-trivial candidates (q >= min_low),
+            # preventing 0.05-score background noise from inverting rare/small-object thresholds above car!
+            active_classes = {
+                int(c) for q, c in zip(rel_list, lbl_list)
+                if int(c) in per_class_entries and math.isfinite(q) and float(q) >= self.min_low
+            } | {int(g) for g in gt_lbl_list if int(g) in per_class_entries}
+            for cls_id in active_classes:
+                c_rels = [q for q, c in zip(rel_list, lbl_list) if int(c) == cls_id]
+                c_tps = [t for t, c in zip(tp_flags, lbl_list) if int(c) == cls_id]
+                c_gt_count = sum(1 for g in gt_lbl_list if int(g) == cls_id)
+                c_denom = max(2.0, 0.5 * float(c_gt_count) + 0.5 * mean_cls_gt[cls_id])
+                c_curve, _ = _monotone_fp_per_gt_curve(c_rels, c_tps, c_denom, self.grid)
+                per_class_entries[cls_id].append((c_curve, deg, regime_i))
 
         diagnostics: dict[str, Any] = {
             "step": int(step),
@@ -613,9 +718,12 @@ class WeightedConformalRiskCalibrator:
                     self.class_low[regime][cls_id] = self.regime_low[regime]
             else:
                 self.regime_high[regime] = float(sol_hi["threshold"])
-                self.regime_low[regime] = float(min(sol_hi["threshold"] - 0.05, sol_lo["threshold"]))
+                self.regime_low[regime] = float(
+                    max(self.min_low, min(sol_hi["threshold"] - 0.08, self.max_low, sol_lo["threshold"]))
+                )
 
-                # Per-class Empirical-Bayes shrinkage toward regime threshold
+                # Per-class Empirical-Bayes shrinkage toward regime threshold (bounded to prevent
+                # small-sample finite-sample penalty from inverting rare/small classes above car)
                 for cls_id in range(1, self.num_classes + 1):
                     entries = per_class_entries[cls_id]
                     if self.use_visibility_weighting:
@@ -636,14 +744,17 @@ class WeightedConformalRiskCalibrator:
                     )
                     c_lo = solve_conformal_threshold(
                         c_curves, c_weights, self.grid, self.alpha_loose,
-                        min_threshold=self.min_low, max_threshold=max(self.min_low, c_hi["threshold"] - 0.05),
+                        min_threshold=self.min_low, max_threshold=max(self.min_low, c_hi["threshold"] - 0.08),
                     )
                     n_c = float(c_hi["n_eff"])
                     blend = n_c / (n_c + self.shrinkage_prior)
                     shrunk_hi = blend * float(c_hi["threshold"]) + (1.0 - blend) * self.regime_high[regime]
                     shrunk_lo = blend * float(c_lo["threshold"]) + (1.0 - blend) * self.regime_low[regime]
-                    shrunk_hi = max(self.min_high, min(self.max_high, shrunk_hi))
-                    shrunk_lo = max(self.min_low, min(shrunk_hi - 0.05, shrunk_lo))
+                    shrunk_hi = max(
+                        self.min_high,
+                        min(self.max_high, self.regime_high[regime] + 0.05, max(self.regime_high[regime] - 0.12, shrunk_hi)),
+                    )
+                    shrunk_lo = max(self.min_low, min(shrunk_hi - 0.08, self.max_low, shrunk_lo))
                     self.class_high[regime][cls_id] = round(shrunk_hi, 4)
                     self.class_low[regime][cls_id] = round(shrunk_lo, 4)
 
@@ -679,6 +790,8 @@ class WeightedConformalRiskCalibrator:
             "min_high": self.min_high,
             "max_high": self.max_high,
             "min_low": self.min_low,
+            "max_low": self.max_low,
+            "max_importance_weight": self.max_importance_weight,
             "shrinkage_prior": self.shrinkage_prior,
             "use_visibility_weighting": self.use_visibility_weighting,
             "num_vis_bins": self.num_vis_bins,
@@ -707,7 +820,10 @@ class WeightedConformalRiskCalibrator:
     def load_state_dict(self, state: dict[str, Any]) -> None:
         if not isinstance(state, dict):
             return
-        for key in ("alpha_strict", "alpha_loose", "min_high", "max_high", "min_low", "shrinkage_prior", "iou_match"):
+        for key in (
+            "alpha_strict", "alpha_loose", "min_high", "max_high",
+            "min_low", "max_low", "max_importance_weight", "shrinkage_prior", "iou_match",
+        ):
             if key in state:
                 setattr(self, key, float(state[key]))
         if "use_visibility_weighting" in state:
