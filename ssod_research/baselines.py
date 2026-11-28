@@ -163,8 +163,9 @@ def _slice_target_by_mask(target: dict[str, torch.Tensor], mask: torch.Tensor) -
     out = {
         "boxes": target["boxes"][mask],
         "labels": target["labels"][mask],
-        "image_id": target["image_id"],
     }
+    if "image_id" in target:
+        out["image_id"] = target["image_id"]
     b = out["boxes"]
     out["area"] = ((b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])).clamp(min=0.0)
     out["iscrowd"] = torch.zeros(len(b), dtype=torch.long, device=b.device)
@@ -195,10 +196,27 @@ def soft_teacher_unsupervised_loss(
         for t, m in zip(aug_targets, reg_valid_list)
     ]
 
-    has_cls = any(len(t["boxes"]) > 0 for t in cls_targets)
-    has_reg = any(len(t["boxes"]) > 0 for t in reg_targets)
-    if not has_cls and not has_reg:
+    active = [
+        i for i in range(len(aug_images))
+        if len(cls_targets[i]["boxes"]) > 0 or len(reg_targets[i]["boxes"]) > 0
+    ]
+    if not active:
         return None, {"unsup": 0.0, "stability": 0.0}
+
+    if len(active) != len(aug_images):
+        aug_images = [aug_images[i] for i in active]
+        cls_targets = [cls_targets[i] for i in active]
+        reg_targets = [reg_targets[i] for i in active]
+        flips = [flips[i] for i in active]
+        teacher_cache = {
+            "features": {k: v[active] for k, v in teacher_cache["features"].items()},
+            "transformed_sizes": [teacher_cache["transformed_sizes"][i] for i in active],
+        }
+
+    cls_pos = [i for i, t in enumerate(cls_targets) if len(t["boxes"]) > 0]
+    reg_pos = [i for i, t in enumerate(reg_targets) if len(t["boxes"]) > 0]
+    has_cls = len(cls_pos) > 0
+    has_reg = len(reg_pos) > 0
 
     original_sizes = [(int(im.shape[-2]), int(im.shape[-1])) for im in aug_images]
     transformed, trans_cls_targets = model.transform(aug_images, cls_targets if has_cls else None)
@@ -207,13 +225,41 @@ def soft_teacher_unsupervised_loss(
         s_features = {"0": s_features}
 
     total = None
-    # 1. RPN + Soft-Negative Classification on cls_valid targets ONLY
+    proposals_by_idx: dict[int, torch.Tensor] = {}
+
+    # 1. RPN + Soft-Negative Classification ONLY on images with >= 1 cls_valid box
     if has_cls and trans_cls_targets is not None:
-        proposals, rpn_losses = model.rpn(transformed, s_features, trans_cls_targets)
+        if len(cls_pos) == len(aug_images):
+            cls_images = transformed
+            cls_s_features = s_features
+            cls_t_sub = trans_cls_targets
+            cls_flips = flips
+            cls_orig_sizes = original_sizes
+            cls_t_cache = teacher_cache
+        else:
+            from torchvision.models.detection.image_list import ImageList
+
+            cls_images = ImageList(
+                transformed.tensors[cls_pos],
+                [transformed.image_sizes[i] for i in cls_pos],
+            )
+            cls_s_features = {k: v[cls_pos] for k, v in s_features.items()}
+            cls_t_sub = [trans_cls_targets[i] for i in cls_pos]
+            cls_flips = [flips[i] for i in cls_pos]
+            cls_orig_sizes = [original_sizes[i] for i in cls_pos]
+            cls_t_cache = {
+                "features": {k: v[cls_pos] for k, v in teacher_cache["features"].items()},
+                "transformed_sizes": [teacher_cache["transformed_sizes"][i] for i in cls_pos],
+            }
+
+        proposals_cls, rpn_losses = model.rpn(cls_images, cls_s_features, cls_t_sub)
+        for idx, prop in zip(cls_pos, proposals_cls):
+            proposals_by_idx[idx] = prop
+
         sampled_props, _, labels_list, _ = model.roi_heads.select_training_samples(
-            proposals, trans_cls_targets
+            proposals_cls, cls_t_sub
         )
-        box_features = model.roi_heads.box_roi_pool(s_features, sampled_props, transformed.image_sizes)
+        box_features = model.roi_heads.box_roi_pool(cls_s_features, sampled_props, cls_images.image_sizes)
         box_features = model.roi_heads.box_head(box_features)
         class_logits, _ = model.roi_heads.box_predictor(box_features)
 
@@ -221,10 +267,10 @@ def soft_teacher_unsupervised_loss(
         t_props_list = []
         for props, was_flipped, s_sz, o_sz, t_sz in zip(
             sampled_props,
-            flips,
-            transformed.image_sizes,
-            original_sizes,
-            teacher_cache["transformed_sizes"],
+            cls_flips,
+            cls_images.image_sizes,
+            cls_orig_sizes,
+            cls_t_cache["transformed_sizes"],
         ):
             p = props.detach().clone()
             p[:, [0, 2]] *= float(o_sz[1]) / max(1, s_sz[1])
@@ -237,7 +283,7 @@ def soft_teacher_unsupervised_loss(
 
         with torch.no_grad():
             t_roi_f = teacher.roi_heads.box_roi_pool(
-                teacher_cache["features"], t_props_list, teacher_cache["transformed_sizes"]
+                cls_t_cache["features"], t_props_list, cls_t_cache["transformed_sizes"]
             )
             t_roi_f = teacher.roi_heads.box_head(t_roi_f)
             t_logits, _ = teacher.roi_heads.box_predictor(t_roi_f)
@@ -253,41 +299,54 @@ def soft_teacher_unsupervised_loss(
         loss_cls = (per_sample_cls * weights).sum() / weights.sum().clamp(min=1.0)
         rpn_total = sum(rpn_losses.values())
         total = rpn_total + loss_cls
-    else:
-        # Still generate proposals (eval/no-target RPN path) for jitter-verified box regression
-        proposals, _ = model.rpn(transformed, s_features, None)
 
     # 2. Box regression ONLY on foreground proposals matched to jitter-verified reg_valid targets
     if has_reg:
-        # Transform reg_targets to student transformed coordinates without redoing backbone
+        missing_reg = [i for i in reg_pos if i not in proposals_by_idx]
+        if missing_reg:
+            from torchvision.models.detection.image_list import ImageList
+
+            extra_imgs = ImageList(
+                transformed.tensors[missing_reg],
+                [transformed.image_sizes[i] for i in missing_reg],
+            )
+            extra_feats = {k: v[missing_reg] for k, v in s_features.items()}
+            extra_props, _ = model.rpn(extra_imgs, extra_feats, None)
+            for idx, prop in zip(missing_reg, extra_props):
+                proposals_by_idx[idx] = prop
+
+        reg_props_in = [proposals_by_idx[i] for i in reg_pos]
         trans_reg_targets = []
-        for tgt, (oh, ow), (th, tw) in zip(reg_targets, original_sizes, transformed.image_sizes):
+        for i in reg_pos:
+            tgt = reg_targets[i]
+            oh, ow = original_sizes[i]
+            th, tw = transformed.image_sizes[i]
             b = tgt["boxes"].clone()
-            if len(b):
-                b[:, [0, 2]] *= float(tw) / max(1, ow)
-                b[:, [1, 3]] *= float(th) / max(1, oh)
+            b[:, [0, 2]] *= float(tw) / max(1, ow)
+            b[:, [1, 3]] *= float(th) / max(1, oh)
             trans_reg_targets.append({"boxes": b, "labels": tgt["labels"]})
 
+        reg_s_features = (
+            s_features if len(reg_pos) == len(aug_images) else {k: v[reg_pos] for k, v in s_features.items()}
+        )
+        reg_img_sizes = [transformed.image_sizes[i] for i in reg_pos]
         reg_props, _, reg_labels_list, reg_gt_deltas_list = model.roi_heads.select_training_samples(
-            proposals, trans_reg_targets
+            reg_props_in, trans_reg_targets
         )
         reg_labels = torch.cat(reg_labels_list, dim=0)
         reg_gt_deltas = torch.cat(reg_gt_deltas_list, dim=0)
         pos_inds = torch.where(reg_labels > 0)[0]
         if len(pos_inds) > 0:
-            # Pool only positive proposals per image to keep compute minimal
-            pos_props_per_img = []
-            for p_img, l_img in zip(reg_props, reg_labels_list):
-                pos_props_per_img.append(p_img[l_img > 0])
-            pos_feats = model.roi_heads.box_roi_pool(s_features, pos_props_per_img, transformed.image_sizes)
+            pos_props_per_img = [p_img[l_img > 0] for p_img, l_img in zip(reg_props, reg_labels_list)]
+            pos_feats = model.roi_heads.box_roi_pool(reg_s_features, pos_props_per_img, reg_img_sizes)
             pos_feats = model.roi_heads.box_head(pos_feats)
             pos_logits, pos_box_reg = model.roi_heads.box_predictor(pos_feats)
             n_pos, num_classes = pos_logits.shape
             pos_box_reg = pos_box_reg.reshape(n_pos, num_classes, 4)
             labels_pos = reg_labels[pos_inds]
             loss_box = F.smooth_l1_loss(
-                pos_box_reg[torch.arange(n_pos, device=labels_pos.device), labels_pos],
-                reg_gt_deltas[pos_inds],
+                pos_box_reg[torch.arange(n_pos, device=labels_pos.device), labels_pos].float(),
+                reg_gt_deltas[pos_inds].float(),
                 beta=1.0 / 9.0,
                 reduction="sum",
             ) / max(1, reg_labels.numel())

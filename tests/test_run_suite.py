@@ -17,6 +17,39 @@ def test_plan_matrices_have_warmup_and_unique_names(tmp_path):
                 assert "--init-checkpoint" in job["command"]
 
 
+def test_a100_reuses_input_paths_with_a_fresh_training_schedule(tmp_path):
+    import json
+
+    old = parse_args(["--preset", "q1_pilot", "--batch-size", "40", "--train-steps", "300",
+                      "--train-images", str(tmp_path / "server images")])
+    path = tmp_path / "experiment_plan.json"
+    path.write_text(json.dumps({"jobs": generate_jobs(old)}), encoding="utf8")
+    args = parse_args(["--preset", "q1_a100", "--dataset-from-plan", str(path)])
+    jobs = generate_jobs(args)
+    assert args.train_images == old.train_images and args.batch_size * args.grad_accum_steps == 8
+    moved = parse_args(["--preset", "q1_a100", "--dataset-from-plan", str(path),
+                        "--val-images", str(tmp_path / "moved")])
+    assert moved.val_images == tmp_path / "moved" and moved.train_images == old.train_images
+    assert [job["steps"] for job in jobs[1:]] == [1500] + [3000] * 5
+    for job in jobs[1:]:
+        assert "--reserve-calibration" in job["command"]
+        assert "--eval-max-images" not in job["command"]
+    assert {job["variant"] for job in jobs[2:]} == {
+        "supervised", "mean_teacher", "soft_teacher", "consistent_teacher", "core_ssod"
+    }
+    # Legacy experiment_plan.json where --train-images/--val-images lived only on train jobs
+    legacy_jobs = json.loads(path.read_text(encoding="utf8"))["jobs"]
+    prep_cmd = legacy_jobs[0]["command"]
+    for drop_flag in ("--train-images", "--val-images"):
+        if drop_flag in prep_cmd:
+            idx = prep_cmd.index(drop_flag)
+            del prep_cmd[idx:idx + 2]
+    legacy_path = tmp_path / "legacy_plan.json"
+    legacy_path.write_text(json.dumps({"jobs": legacy_jobs}), encoding="utf8")
+    legacy_args = parse_args(["--preset", "q1_a100", "--dataset-from-plan", str(legacy_path)])
+    assert legacy_args.train_images == old.train_images and legacy_args.val_images == old.val_images
+
+
 def test_threshold_ablation_is_explicit(tmp_path):
     args = parse_args(["--preset", "pilot", "--output", str(tmp_path)])
     jobs = generate_jobs(args)

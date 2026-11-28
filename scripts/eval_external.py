@@ -30,6 +30,7 @@ def main(argv=None):
     p.add_argument("--images", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--max-side", type=int, default=800)
+    p.add_argument("--weights", choices=("auto", "student", "teacher"), default="auto")
     p.add_argument("--max-images", type=int, default=0)
     p.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     args = p.parse_args(argv)
@@ -41,13 +42,16 @@ def main(argv=None):
     state = safe_torch_load(args.checkpoint)
     detector_type = (state.get("config") or {}).get("detector", "fasterrcnn_v1")
     model = build_model(pretrained_backbone=False, max_side=args.max_side, detector=detector_type).to(device)
-    weights = state.get("teacher") or state.get("student")
+    selected = args.weights
+    if selected == "auto":
+        selected = "teacher" if state.get("teacher") is not None else "student"
+    weights = state.get(selected)
     if weights is None:
-        raise ValueError("Checkpoint contains neither teacher nor student weights")
+        raise ValueError(f"Checkpoint contains no {selected} weights")
     model.load_state_dict(weights, strict=True)
 
     dataset = RoadCocoDataset(args.coco_ann, args.images, max_side=args.max_side)
-    eval_fp = f"{sha256_file(args.checkpoint)}:{args.max_side}:{args.max_images}"
+    eval_fp = f"{sha256_file(args.checkpoint)}:{args.max_side}:{args.max_images}:{selected}"
     metrics = evaluate(
         model,
         dataset,
@@ -59,6 +63,7 @@ def main(argv=None):
     )
     report = {
         "checkpoint": str(args.checkpoint),
+        "weights": selected,
         "detector": detector_type,
         "dataset": str(args.coco_ann),
         "max_side": int(args.max_side),

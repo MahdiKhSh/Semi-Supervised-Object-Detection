@@ -724,46 +724,33 @@ def _rpn_forward_with_zone2_ignore(
     *,
     ignore_iou_thresh: float = 0.30,
 ) -> tuple[list[torch.Tensor], dict[str, torch.Tensor], int]:
-    """Run TorchVision RPN while ignoring negative anchors overlapping Zone-2 boxes.
+    """Run TorchVision RPN (preserving module hooks) while ignoring negative anchors overlapping Zone-2 boxes."""
+    orig_assign = rpn.assign_targets_to_anchors
+    ignored_anchors = [0]
 
-    Prevents the RPN from crushing missed/adverse-weather Zone-2 objects into hard
-    background without altering genuine background negative sampling.
-    """
-    from torchvision.models.detection.rpn import concat_box_prediction_layers
+    def _assign_with_zone2_ignore(anchors, tgts):
+        labels, matched_gt_boxes = orig_assign(anchors, tgts)
+        for img_idx, (anc, lbl, z2_b) in enumerate(zip(anchors, labels, zone2_boxes_list)):
+            if len(z2_b) == 0 or len(anc) == 0:
+                continue
+            neg_inds = torch.where(lbl == 0)[0]
+            if len(neg_inds) == 0:
+                continue
+            max_z2_iou = box_iou(anc[neg_inds], z2_b).max(dim=1).values
+            ambig_neg = neg_inds[max_z2_iou >= ignore_iou_thresh]
+            if len(ambig_neg) > 0:
+                lbl = lbl.clone()
+                lbl[ambig_neg] = -1.0  # -1 is ignored by BalancedPositiveNegativeSampler
+                ignored_anchors[0] += int(len(ambig_neg))
+                labels[img_idx] = lbl
+        return labels, matched_gt_boxes
 
-    feat_list = list(features.values())
-    objectness, pred_bbox_deltas = rpn.head(feat_list)
-    anchors = rpn.anchor_generator(images, feat_list)
-
-    num_images = len(anchors)
-    num_anchors_per_level = [o[0].shape[0] * o[0].shape[1] * o[0].shape[2] for o in objectness]
-    objectness, pred_bbox_deltas = concat_box_prediction_layers(objectness, pred_bbox_deltas)
-    proposals = rpn.box_coder.decode(pred_bbox_deltas.detach(), anchors)
-    proposals = proposals.view(num_images, -1, 4)
-    boxes, _ = rpn.filter_proposals(proposals, objectness, images.image_sizes, num_anchors_per_level)
-
-    labels, matched_gt_boxes = rpn.assign_targets_to_anchors(anchors, targets)
-    ignored_anchors = 0
-    for img_idx, (anc, lbl, z2_b) in enumerate(zip(anchors, labels, zone2_boxes_list)):
-        if len(z2_b) == 0 or len(anc) == 0:
-            continue
-        neg_inds = torch.where(lbl == 0)[0]
-        if len(neg_inds) == 0:
-            continue
-        # Check IoU only for negative anchors to keep memory tiny
-        neg_anc = anc[neg_inds]
-        max_z2_iou = box_iou(neg_anc, z2_b).max(dim=1).values
-        ambig_neg = neg_inds[max_z2_iou >= ignore_iou_thresh]
-        if len(ambig_neg) > 0:
-            lbl[ambig_neg] = -1.0  # -1 is ignored by BalancedPositiveNegativeSampler
-            ignored_anchors += int(len(ambig_neg))
-        labels[img_idx] = lbl
-
-    regression_targets = rpn.box_coder.encode(matched_gt_boxes, anchors)
-    loss_objectness, loss_rpn_box_reg = rpn.compute_loss(
-        objectness, pred_bbox_deltas, labels, regression_targets
-    )
-    return boxes, {"loss_objectness": loss_objectness, "loss_rpn_box_reg": loss_rpn_box_reg}, ignored_anchors
+    rpn.assign_targets_to_anchors = _assign_with_zone2_ignore
+    try:
+        boxes, rpn_losses = rpn(images, features, targets)
+    finally:
+        rpn.assign_targets_to_anchors = orig_assign
+    return boxes, rpn_losses, ignored_anchors[0]
 
 
 def _kl_soft_distillation(
@@ -885,20 +872,57 @@ def care_unsupervised_loss(
     stab_loss_val = 0.0
     suppressed_bg = 0
 
-    # 1. Zone-1 RPN + Conformal Soft-Negative ROI loss
+    # 1. Zone-1 RPN + Conformal Soft-Negative ROI loss ONLY on images with >= 1 Zone-1 box
+    #    (An unlabeled image with 0 Zone-1 pseudo-boxes is unknown foreground — e.g. dark night —
+    #     NOT a verified empty negative image! Full feature maps are retained below for Zone-2 KL.)
     if has_z1 and transformed_targets is not None:
-        if use_tri_zone and has_z2:
+        positive = [i for i, target in enumerate(transformed_targets) if len(target["boxes"]) > 0]
+        if len(positive) == len(aug_images):
+            det_images = transformed
+            det_features = features
+            det_targets = transformed_targets
+            det_orig_sizes = original_sizes
+            det_z1_meta = zone1_meta
+            det_z2_meta = zone2_meta
+            det_ambig = ambig_trans
+            det_flips = flips
+            det_t_cache = teacher_cache
+        else:
+            from torchvision.models.detection.image_list import ImageList
+
+            det_images = ImageList(
+                transformed.tensors[positive],
+                [transformed.image_sizes[i] for i in positive],
+            )
+            det_features = {k: v[positive] for k, v in features.items()}
+            det_targets = [transformed_targets[i] for i in positive]
+            det_orig_sizes = [original_sizes[i] for i in positive]
+            det_z1_meta = [zone1_meta[i] for i in positive]
+            det_z2_meta = [zone2_meta[i] for i in positive]
+            det_ambig = [ambig_trans[i] for i in positive]
+            det_flips = [flips[i] for i in positive] if flips is not None else None
+            det_t_cache = (
+                {
+                    "features": {k: v[positive] for k, v in teacher_cache["features"].items()},
+                    "transformed_sizes": [teacher_cache["transformed_sizes"][i] for i in positive],
+                }
+                if teacher_cache is not None
+                else None
+            )
+
+        det_has_z2 = use_tri_zone and any(len(b) > 0 for b in det_ambig)
+        if det_has_z2:
             proposals, rpn_losses, ignored_rpn = _rpn_forward_with_zone2_ignore(
-                model.rpn, transformed, features, transformed_targets, ambig_trans
+                model.rpn, det_images, det_features, det_targets, det_ambig
             )
             suppressed_bg += ignored_rpn
         else:
-            proposals, rpn_losses = model.rpn(transformed, features, transformed_targets)
+            proposals, rpn_losses = model.rpn(det_images, det_features, det_targets)
 
         sampled_props, matched_idxs, labels_list, reg_targets_list = model.roi_heads.select_training_samples(
-            proposals, transformed_targets
+            proposals, det_targets
         )
-        box_features = model.roi_heads.box_roi_pool(features, sampled_props, transformed.image_sizes)
+        box_features = model.roi_heads.box_roi_pool(det_features, sampled_props, det_images.image_sizes)
         box_features = model.roi_heads.box_head(box_features)
         class_logits, box_regression = model.roi_heads.box_predictor(box_features)
 
@@ -913,7 +937,7 @@ def care_unsupervised_loss(
         # (a) Foreground reliability weights from matched Zone-1 boxes
         fg_rel_per_prop = []
         fg_qloc_per_prop = []
-        for m_idx, z1_m in zip(matched_idxs, zone1_meta):
+        for m_idx, z1_m in zip(matched_idxs, det_z1_meta):
             rel = z1_m.get("reliability")
             qloc = z1_m.get("q_loc")
             if rel is None or len(rel) == 0:
@@ -936,14 +960,14 @@ def care_unsupervised_loss(
         if bool(bg_mask.any()):
             # Base teacher p_T(bg) via cached F1 features (zero extra backbone pass!)
             t_bg_all = None
-            if teacher is not None and teacher_cache is not None and flips is not None:
+            if teacher is not None and det_t_cache is not None and det_flips is not None:
                 t_props_list = []
                 for props, was_flipped, s_sz, o_sz, t_sz in zip(
                     sampled_props,
-                    flips,
-                    transformed.image_sizes,
-                    original_sizes,
-                    teacher_cache["transformed_sizes"],
+                    det_flips,
+                    det_images.image_sizes,
+                    det_orig_sizes,
+                    det_t_cache["transformed_sizes"],
                 ):
                     p = props.detach().clone()
                     p[:, [0, 2]] *= float(o_sz[1]) / max(1, s_sz[1])
@@ -955,7 +979,7 @@ def care_unsupervised_loss(
                     t_props_list.append(p)
                 with torch.no_grad():
                     t_roi_f = teacher.roi_heads.box_roi_pool(
-                        teacher_cache["features"], t_props_list, teacher_cache["transformed_sizes"]
+                        det_t_cache["features"], t_props_list, det_t_cache["transformed_sizes"]
                     )
                     t_roi_f = teacher.roi_heads.box_head(t_roi_f)
                     t_logits, _ = teacher.roi_heads.box_predictor(t_roi_f)
@@ -963,7 +987,7 @@ def care_unsupervised_loss(
 
             # Conformal Zone-2 attenuation: (1 - pi_hat_r(q_z2)) when proposal overlaps a Zone-2 box
             z2_atten_parts = []
-            for props, z2_b, z2_m in zip(sampled_props, ambig_trans, zone2_meta):
+            for props, z2_b, z2_m in zip(sampled_props, det_ambig, det_z2_meta):
                 atten = torch.ones(len(props), dtype=torch.float32, device=props.device)
                 if use_tri_zone and len(z2_b) > 0 and len(props) > 0:
                     iou_z2 = box_iou(props.detach(), z2_b)
@@ -1006,7 +1030,7 @@ def care_unsupervised_loss(
             if giou_weight > 0.0:
                 all_props_cat = torch.cat(sampled_props, dim=0)
                 gt_matched_parts = []
-                for m_idx, tgt_t in zip(matched_idxs, transformed_targets):
+                for m_idx, tgt_t in zip(matched_idxs, det_targets):
                     gb = tgt_t["boxes"].detach()
                     if len(gb) == 0:
                         gt_matched_parts.append(all_props_cat.new_zeros((len(m_idx), 4)))

@@ -61,7 +61,7 @@ def split_calibration_indices(
     """
     n = int(dataset_size)
     if n < 2:
-        return list(range(n)), list(range(n))
+        return list(range(n)), []
     indices = list(range(n))
     rng = random.Random(int(seed) * 9973 + 17)
     rng.shuffle(indices)
@@ -300,10 +300,10 @@ class WeightedConformalRiskCalibrator:
         self,
         num_foreground_classes: int = 10,
         *,
-        alpha_strict: float = 0.08,
+        alpha_strict: float = 0.10,
         alpha_loose: float = 0.30,
         min_high: float = 0.45,
-        max_high: float = 0.90,
+        max_high: float = 0.95,
         min_low: float = 0.25,
         shrinkage_prior: float = 20.0,
         use_visibility_weighting: bool = True,
@@ -653,6 +653,8 @@ class WeightedConformalRiskCalibrator:
             emp_recall = sum(r[1] for r in acc_recs) / max(1, eval_gt)
             diagnostics["regimes"][regime] = {
                 "cal_regime_images": int(eval_n_imgs),
+                "ground_truth_boxes": int(eval_gt),
+                "accepted_detections": len(acc_recs),
                 "tau_high": round(self.regime_high[regime], 4),
                 "tau_low": round(self.regime_low[regime], 4),
                 "empirical_weighted_risk": sol_hi["empirical_risk"],

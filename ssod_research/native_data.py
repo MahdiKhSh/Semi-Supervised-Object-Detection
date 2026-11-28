@@ -1,4 +1,4 @@
-"""Small, deterministic COCO-style RGB detection dataset for native Windows training.
+"""Small, deterministic COCO-style RGB detection dataset for native Windows & Linux training.
 
 Images and labels remain local, are never uploaded, and image resize transforms
 xyxy boxes consistently. Coordinates are half-open pixel boxes after resize.
@@ -13,6 +13,53 @@ from pathlib import Path
 from PIL import Image
 import torch
 import torchvision.transforms.functional as TF
+
+_IMAGE_INDEX_CACHE: dict[str, dict[str, Path]] = {}
+
+
+def build_image_index(image_dir: Path | str, *, force_refresh: bool = False) -> dict[str, Path]:
+    """Build (and cache) a filename -> Path index recursively under ``image_dir``.
+
+    Supports both flat BDD100K layouts (``100k/train/<name>.jpg``) and nested
+    server/Kaggle/mirror layouts (e.g. ``100k/train/trainA/<name>.jpg``,
+    ``100k/train/trainB/<name>.jpg``) in a single fast directory walk.
+    """
+    root = Path(image_dir).resolve()
+    key = str(root)
+    if not force_refresh and key in _IMAGE_INDEX_CACHE:
+        return _IMAGE_INDEX_CACHE[key]
+    index: dict[str, Path] = {}
+    if root.is_dir():
+        for dirpath, _dirnames, filenames in os.walk(root):
+            base = Path(dirpath)
+            rel_dir = base.relative_to(root)
+            is_root = str(rel_dir) == "."
+            for fname in filenames:
+                full = base / fname
+                if not is_root:
+                    index.setdefault((rel_dir / fname).as_posix(), full)
+                index.setdefault(fname, full)
+    _IMAGE_INDEX_CACHE[key] = index
+    return index
+
+
+def resolve_image_path(image_dir: Path | str, file_name: str) -> Path | None:
+    """Resolve ``file_name`` via cached recursive index (fast O(1) after first walk)."""
+    root = Path(image_dir).resolve()
+    index = build_image_index(root)
+    found = index.get(file_name) or index.get(Path(file_name).name)
+    if found is not None and found.is_file():
+        return found
+    # Fallback refresh in case files were added after initial cache build
+    direct = root / file_name
+    if direct.is_file():
+        index[file_name] = direct
+        return direct
+    index = build_image_index(root, force_refresh=True)
+    found = index.get(file_name) or index.get(Path(file_name).name)
+    if found is not None and found.is_file():
+        return found
+    return None
 
 
 class RoadCocoDataset:
@@ -40,15 +87,16 @@ class RoadCocoDataset:
         self._names = [im["file_name"] for im in self.images]
         if len(self._names) != len(set(self._names)):
             raise ValueError("duplicate filenames in COCO dataset")
+        build_image_index(self.image_dir)
 
     def __len__(self):
         return len(self.images)
 
     def __getitem__(self, idx):
         info = self.images[idx]
-        path = self.image_dir / info["file_name"]
-        if not path.is_file():
-            raise FileNotFoundError(f"image not found: {path}")
+        path = resolve_image_path(self.image_dir, info["file_name"])
+        if path is None:
+            raise FileNotFoundError(f"image not found: {self.image_dir / info['file_name']}")
         with Image.open(path) as pil:
             image = pil.convert("RGB")
         w, h = image.size
@@ -108,12 +156,12 @@ def image_inventory_check(annotation_file, image_dir, *, check_every_image=True)
     if len(names) != len(set(names)):
         raise ValueError("duplicate image filenames")
     candidates = names if check_every_image else names[:50]
-    img_dir = Path(image_dir)
-    if all(("/" not in name and "\\" not in name) for name in candidates):
-        present = set(os.listdir(img_dir))
-        missing = [name for name in candidates if name not in present]
-    else:
-        missing = [name for name in candidates if not (img_dir / name).is_file()]
+    root = Path(image_dir).resolve()
+    index = build_image_index(root, force_refresh=True)
+    missing = [
+        name for name in candidates
+        if (name not in index and Path(name).name not in index)
+    ]
     if missing:
         raise FileNotFoundError(f"{len(missing)} missing images, first examples: {missing[:5]}")
     return {"count": len(names), "annotations": len(obj.get("annotations", [])), "image_directory": str(image_dir)}

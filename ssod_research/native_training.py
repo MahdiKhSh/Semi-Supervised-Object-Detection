@@ -29,6 +29,7 @@ import os
 from pathlib import Path
 import random
 import signal
+import subprocess
 import time
 
 import numpy as np
@@ -105,6 +106,23 @@ _NON_IDENTITY_KEYS = frozenset({
 
 def sha256_file(path):
     return _sha256_file(path, use_cache=False)
+
+
+def source_revision():
+    root = Path(__file__).resolve().parents[1]
+    try:
+        head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root, stderr=subprocess.DEVNULL, text=True
+        ).strip()
+        dirty = subprocess.check_output(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=root,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return {"commit": head, "tracked_changes": bool(dirty.strip())}
 
 
 def seed_all(seed, deterministic: bool = False):
@@ -636,6 +654,8 @@ def build_scientific_identity(args, *, init_checkpoint_sha256: str | None = None
     config = vars(args).copy()
     identity = {k: v for k, v in config.items() if k not in _NON_IDENTITY_KEYS}
     identity["effective_batch_size"] = int(getattr(args, "batch_size", 1)) * int(getattr(args, "grad_accum_steps", 1))
+    if not identity.get("reserve_calibration"):
+        identity.pop("reserve_calibration", None)  # Compatible with older unreserved runs.
     if init_checkpoint_sha256:
         identity["init_checkpoint_sha256"] = init_checkpoint_sha256
     return identity
@@ -719,6 +739,8 @@ def parse_args(argv=None):
         choices=("constant", "multistep", "cosine", "warmup_constant", "warmup_cosine", "warmup_multistep"),
     )
     p.add_argument("--lr-warmup-steps", type=int, default=0)
+    p.add_argument("--reserve-calibration", action="store_true",
+                   help="Exclude the CoRe calibration fold from supervised sampling, including warm-up.")
     p.add_argument("--ema", type=float, default=0.999)
     p.add_argument("--pseudo-threshold", type=float, default=0.7)
     p.add_argument("--min-quality", type=float, default=0.3)
@@ -742,7 +764,7 @@ def parse_args(argv=None):
     p.add_argument("--care-kl-z1-weight", type=float, default=0.15)
     p.add_argument("--care-kl-z2-weight", type=float, default=0.05)
     p.add_argument("--care-temperature", type=float, default=1.5)
-    p.add_argument("--conformal-alpha-strict", type=float, default=0.08)
+    p.add_argument("--conformal-alpha-strict", type=float, default=0.10)
     p.add_argument("--conformal-alpha-loose", type=float, default=0.30)
     p.add_argument("--conformal-every", type=int, default=250)
     p.add_argument("--conformal-cal-fraction", type=float, default=0.08)
@@ -833,6 +855,8 @@ def _train_locked(args, out: Path):
     named = set(im["file_name"] for im in labeled.images)
     if unlabeled is not None and named.intersection(im["file_name"] for im in unlabeled.images):
         raise ValueError("labeled/unlabeled image leakage")
+    if unlabeled is not None:
+        named.update(im["file_name"] for im in unlabeled.images)
     if named.intersection(im["file_name"] for im in validation.images):
         raise ValueError("train/validation image leakage")
 
@@ -893,16 +917,20 @@ def _train_locked(args, out: Path):
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and amp_mode == "fp16"))
 
     # Strictly disjoint calibration split carved ONLY from labeled training data (never val.json)
-    if args.variant == "core_ssod":
+    if args.reserve_calibration or args.variant == "core_ssod":
         train_labeled_ids, cal_labeled_ids = split_calibration_indices(
             len(labeled),
             seed=args.seed,
             cal_fraction=float(args.conformal_cal_fraction),
             max_cal=int(args.conformal_max_cal),
         )
+        if not cal_labeled_ids:
+            raise ValueError("Calibration needs at least two labeled images for disjoint train and calibration folds")
     else:
         train_labeled_ids = list(range(len(labeled)))
         cal_labeled_ids = []
+
+    fold_hash = stable_hash([labeled.images[i]["file_name"] for i in cal_labeled_ids]) if cal_labeled_ids else None
 
     running_stats = {"total_candidates": 0, "total_accepted": 0, "total_quality_sum": 0.0}
     care_calibrator = (
@@ -1038,6 +1066,13 @@ def _train_locked(args, out: Path):
         warmup = safe_torch_load(args.init_checkpoint)
         if warmup.get("step", 0) < 1 or "student" not in warmup:
             raise ValueError("warm-start checkpoint must be from a successful supervised run")
+        if args.reserve_calibration and (
+            warmup.get("calibration_fold_sha256") != fold_hash
+            or not warmup.get("config", {}).get("reserve_calibration")
+            or warmup.get("config", {}).get("variant") != "supervised"
+            or warmup.get("dataset_hashes", {}).get(label_path.name) != dataset_hashes[label_path.name]
+        ):
+            raise ValueError("Warm-up must reserve the same calibration images from the same labeled split.")
         model.load_state_dict(warmup["student"], strict=True)
         if teacher is not None:
             teacher.load_state_dict(warmup["student"], strict=True)
@@ -1059,11 +1094,15 @@ def _train_locked(args, out: Path):
         "created_utc": previous_metadata.get("created_utc") or utc_now(),
         "updated_utc": utc_now(),
         "arguments": config,
+        "source_revision": source_revision(),
+        "calibration_fold_sha256": fold_hash,
         "scientific_identity": scientific_identity,
         "fingerprint": fingerprint,
         "config_fingerprint": config_fingerprint,
         "dataset_fingerprint": dataset_fingerprint,
         "data": inventories,
+        "supervised_pool_images": len(train_labeled_ids),
+        "calibration_pool_images": len(cal_labeled_ids),
         "dataset_sha256": dataset_hashes,
         "hardware": hardware_profile,
         "torch": torch.__version__,
@@ -1116,6 +1155,9 @@ def _train_locked(args, out: Path):
         prev_sigint = None
         prev_sigterm = None
 
+    grad_accum = max(1, int(getattr(args, "grad_accum_steps", 1)))
+    eff_batch = int(args.batch_size) * grad_accum
+
     def _save_full_checkpoint(step_num: int):
         nonlocal last_saved_step
         elapsed_total = round(previous_seconds + (time.monotonic() - started), 2)
@@ -1123,7 +1165,7 @@ def _train_locked(args, out: Path):
             max(previous_peak, (torch.cuda.max_memory_reserved() / 2**30) if device.type == "cuda" else 0.0),
             3,
         )
-        epoch_float = round((step_num * args.batch_size) / max(1, len(labeled)), 6)
+        epoch_float = round((step_num * eff_batch) / max(1, len(train_labeled_ids)), 6)
         payload = {
             "format_version": CHECKPOINT_FORMAT_VERSION,
             "fingerprint": fingerprint,
@@ -1134,6 +1176,8 @@ def _train_locked(args, out: Path):
             "step": int(step_num),
             "epoch": epoch_float,
             "student": model.state_dict(),
+            "source_revision": metadata["source_revision"],
+            "calibration_fold_sha256": fold_hash,
             "teacher": teacher.state_dict() if teacher is not None else None,
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
@@ -1144,6 +1188,7 @@ def _train_locked(args, out: Path):
                 "seed": int(args.seed),
                 "batch_size": int(args.batch_size),
                 "labeled_size": len(labeled),
+                "supervised_pool_size": len(train_labeled_ids),
                 "unlabeled_size": len(unlabeled) if unlabeled is not None else 0,
                 "next_step": int(step_num),
             },
@@ -1225,9 +1270,6 @@ def _train_locked(args, out: Path):
             append_jsonl(eval_log, metrics_row)
         print("EVAL", json.dumps(metrics_row), flush=True)
         return metrics_row
-
-    grad_accum = max(1, int(getattr(args, "grad_accum_steps", 1)))
-    eff_batch = int(args.batch_size) * grad_accum
 
     def _run_conformal_calibration(step_num: int):
         if conformal_calibrator is None or teacher is None or not cal_labeled_ids:
@@ -1473,9 +1515,11 @@ def _train_locked(args, out: Path):
                                 }
                             empty_z2 = {"boxes": boxes.new_zeros((0, 4))}
                             a_img, a_z1, _ = strong_view_care(img, z1, empty_z2, rng=img_rng, enable_cutout=True)
+                            if not len(a_z1["boxes"]):
+                                continue
                             aug_images.append(a_img)
                             aug_targets.append(target_for_training(a_z1, image_id=int(target["image_id"])))
-                        if any(len(t["boxes"]) > 0 for t in aug_targets):
+                        if aug_targets:
                             with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
                                 unsup_losses = model(aug_images, aug_targets)
                                 unsupervised = sum(unsup_losses.values())
@@ -1512,8 +1556,9 @@ def _train_locked(args, out: Path):
                                                      brightness=brightness, contrast=contrast)
                             trans["scores"] = p["scores"]
                             trans["uncertainty"] = p["uncertainty"]
-                            augmented.append((img, trans))
-                        if any(len(t["boxes"]) > 0 for _, t in augmented):
+                            if len(trans["boxes"]):
+                                augmented.append((img, trans))
+                        if augmented:
                             aug_images = [item[0] for item in augmented]
                             aug_targets = [target_for_training(item[1], image_id=int(item[1]["image_id"]))
                                            for item in augmented]
@@ -1545,11 +1590,13 @@ def _train_locked(args, out: Path):
 
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
+            previous_scale = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
-            if teacher is not None:
-                ema_update(teacher, model, min(args.ema, 1 - 1 / (step + 2)))
+            if not scaler.is_enabled() or scaler.get_scale() >= previous_scale:
+                scheduler.step()
+                if teacher is not None:
+                    ema_update(teacher, model, min(args.ema, 1 - 1 / (step + 2)))
 
             current_step = step + 1
             steps_this_call += 1
@@ -1582,8 +1629,12 @@ def _train_locked(args, out: Path):
         # Ensure final evaluation exists even if training finished in an earlier
         # run and crashed during final evaluation before completion was recorded.
         final_eval_done = any(int(r.get("step", -1)) == int(args.steps) for r in read_jsonl(eval_log))
-        final_metrics_file = out / f"eval_{args.steps:07d}" / "metrics.json"
-        if not final_eval_done or not (read_json(final_metrics_file) or {}).get("complete"):
+        final_dir = out / f"eval_{args.steps:07d}"
+        if (
+            not final_eval_done
+            or not (read_json(final_dir / "metrics.json") or {}).get("complete")
+            or not (final_dir / "detections.json").is_file()
+        ):
             _run_evaluation(args.steps)
 
         metadata["status"] = "completed"
